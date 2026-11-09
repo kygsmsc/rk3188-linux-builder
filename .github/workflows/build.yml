@@ -1,0 +1,161 @@
+name: Build RK3188 Linux Boot & Rootfs
+
+on:
+  workflow_dispatch: # 允许手动点击运行
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+    - name: 1. 检出仓库代码
+      uses: actions/checkout@v4
+
+    - name: 2. 安装构建依赖
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          gcc-arm-linux-gnueabihf build-essential bc libssl-dev libncurses-dev \
+          flex bison libelf-dev device-tree-compiler cpio rsync zip \
+          qemu-user-static binfmt-support debootstrap e2fsprogs
+
+    - name: 3. 下载并编译 Linux 内核 (v6.12.116)
+      run: |
+        echo "==> 下载 Linux 6.12.116..."
+        wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.116.tar.xz
+        tar -xf linux-6.12.116.tar.xz
+        cd linux-6.12.116
+
+        echo "==> 复制自定义 DTS..."
+        cp ../dts/rk3188-adesk-std.dts arch/arm/boot/dts/rockchip/
+
+        echo "==> 配置内核..."
+        make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- rockchip_defconfig
+        
+        # 强制开启 DTB 附加功能
+        scripts/config --enable CONFIG_ARM_APPENDED_DTB
+
+        echo "==> 编译内核与 DTB..."
+        make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- -j$(nproc) zImage dtbs
+
+        echo "==> 合并 zImage 和 DTB..."
+        cat arch/arm/boot/zImage arch/arm/boot/dts/rockchip/rk3188-adesk-std.dtb > zImage-dtb
+        ls -lh zImage-dtb
+
+    - name: 4. 构建 Ubuntu 22.04 根文件系统
+      run: |
+        ROOTFS_DIR="rootfs"
+        mkdir -p $ROOTFS_DIR
+
+        echo "==> 使用 debootstrap 构建基础系统..."
+        sudo debootstrap --arch=armhf --variant=minbase \
+          --include=systemd,sudo,ssh,net-tools,iproute2,ifupdown,network-manager,rsyslog,htop,vim,nano,e2fsprogs \
+          jammy $ROOTFS_DIR http://ports.ubuntu.com/ubuntu-ports/
+
+        echo "==> 配置 rootfs..."
+        sudo cp /usr/bin/qemu-arm-static $ROOTFS_DIR/usr/bin/
+        sudo mount --bind /dev $ROOTFS_DIR/dev
+        sudo mount --bind /proc $ROOTFS_DIR/proc
+        sudo mount --bind /sys $ROOTFS_DIR/sys
+
+        sudo chroot $ROOTFS_DIR /bin/bash -c "
+          echo 'root:root' | chpasswd
+          sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config
+          echo 'rk3188-box' > /etc/hostname
+          echo '127.0.0.1 localhost' > /etc/hosts
+          echo '127.0.1.1 rk3188-box' >> /etc/hosts
+          # 配置 DHCP 网络
+          cat > /etc/network/interfaces.d/eth0 << 'EOF'
+          auto eth0
+          iface eth0 inet dhcp
+          EOF
+          systemctl enable systemd-resolved
+          systemctl enable NetworkManager
+          systemctl enable ssh
+        "
+
+        sudo umount $ROOTFS_DIR/dev $ROOTFS_DIR/proc $ROOTFS_DIR/sys
+        sudo rm -f $ROOTFS_DIR/usr/bin/qemu-arm-static
+
+        echo "==> 打包 rootfs 为 2GB 的 ext4 镜像..."
+        dd if=/dev/zero of=rootfs.img bs=1M count=2048 status=progress
+        mkfs.ext4 -F -L "rootfs" rootfs.img
+        mkdir -p mnt
+        sudo mount -o loop rootfs.img mnt
+        sudo cp -a $ROOTFS_DIR/. mnt/
+        sudo umount mnt
+        e2fsck -p -f rootfs.img || true
+        ls -lh rootfs.img
+
+    - name: 5. 打包 boot.img
+      run: |
+        echo "==> 克隆 Rockchip mkbootimg 工具..."
+        git clone https://github.com/neo-technologies/rockchip-mkbootimg.git
+        cd rockchip-mkbootimg
+        make
+        cd ..
+
+        echo "==> 创建空的 ramdisk..."
+        mkdir -p empty_ramdisk
+        cd empty_ramdisk
+        find . -print0 | cpio --null -ov --format=newc > ../initrd.img
+        cd ..
+
+        echo "==> 使用 mkbootimg 打包..."
+        ./rockchip-mkbootimg/mkbootimg \
+          --kernel linux-6.12.116/zImage-dtb \
+          --ramdisk initrd.img \
+          --cmdline "console=ttyS0,115200 root=/dev/mmcblk0p2 rootwait rw" \
+          -o boot.img
+        ls -lh boot.img
+
+    - name: 6. 生成 parameter.txt (针对 4GB eMMC 最简分区)
+      run: |
+        cat > parameter.txt << 'EOF'
+        FIRMWARE_VER: 1.0
+        MACHINE_MODEL: RK3188
+        MACHINE_ID: 007
+        MANUFACTURER: RK3188
+        MAGIC: 0x5041524B
+        ATAG: 0x00200800
+        MACHINE: 0xffffffff
+        CHECK_MASK: 0x80
+        PWR_HLD: 0,0,A,0,1
+        CMDLINE: console=ttyS0,115200n8 root=/dev/mmcblk0p2 rootwait rw rootfstype=ext4
+        CMDLINE: mtdparts=rk29xxnand:0x00010000@0x00004000(boot),0x00600000@0x00014000(rootfs),-@0x00614000(userdata)
+        EOF
+        ls -lh parameter.txt
+
+    - name: 7. 打包汇总并上传
+      run: |
+        mkdir -p RK3188_Linux_Package
+        cp boot.img rootfs.img parameter.txt RK3188_Linux_Package/
+        
+        # 写入说明文件
+        cat > RK3188_Linux_Package/刷机说明.txt << 'EOF'
+        ================================================
+        RK3188 Ubuntu 22.04 刷机包
+        ================================================
+        1. 打开 RKDevTool (瑞芯微开发工具)
+        2. 加载 Loader (选你原厂线刷包的 Loader.bin)
+        3. 勾选 Parameter，选择 parameter.txt
+        4. 勾选 boot，选择 boot.img
+        5. 勾选 rootfs，选择 rootfs.img
+        6. 点击执行，等待完成。
+        
+        初始账号: root
+        初始密码: root
+        默认网卡: eth0 (DHCP 自动获取 IP)
+        ================================================
+        EOF
+        
+        cd RK3188_Linux_Package
+        zip -r ../rk3188-linux-images.zip .
+        
+    - name: 8. 上传构建产物
+      uses: actions/upload-artifact@v4
+      with:
+        name: rk3188-linux-flash-package
+        path: rk3188-linux-images.zip
+        retention-days: 7
