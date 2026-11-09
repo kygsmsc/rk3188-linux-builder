@@ -30,11 +30,14 @@ jobs:
         echo "==> 复制自定义 DTS..."
         cp ../dts/rk3188-adesk-std.dts arch/arm/boot/dts/rockchip/
 
-        echo "==> 配置内核..."
-        make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- rockchip_defconfig
+        echo "==> 使用 multi_v7_defconfig 配置内核..."
+        make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- multi_v7_defconfig
         
         # 强制开启 DTB 附加功能
         scripts/config --enable CONFIG_ARM_APPENDED_DTB
+        # 确保 RK3188 支持被启用 (multi_v7_defconfig 默认可能未选)
+        scripts/config --enable CONFIG_ARCH_ROCKCHIP
+        scripts/config --enable CONFIG_ROCKCHIP_RK3188
 
         echo "==> 编译内核与 DTB..."
         make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- -j$(nproc) zImage dtbs
