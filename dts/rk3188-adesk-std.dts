@@ -13,8 +13,8 @@
 
 	aliases {
 		serial0 = &uart0;
-		mmc0 = &sdmmc;
-		mmc1 = &emmc;
+		mmc0 = &mmc0;   /* SD 卡控制器 */
+		mmc1 = &emmc;   /* eMMC 控制器 */
 	};
 
 	chosen {
@@ -24,7 +24,7 @@
 
 	memory@60000000 {
 		device_type = "memory";
-		reg = <0x60000000 0x40000000>; /* 1GB */
+		reg = <0x60000000 0x40000000>; /* 1GB DDR3 */
 	};
 
 	reserved-memory {
@@ -155,6 +155,7 @@
 	};
 };
 
+/* eMMC 控制器 */
 &emmc {
 	bus-width = <8>;
 	cap-mmc-highspeed;
@@ -165,7 +166,8 @@
 	status = "okay";
 };
 
-&sdmmc {
+/* SD 卡槽控制器 (已由 &sdmmc 修正为 &mmc0) */
+&mmc0 {
 	bus-width = <4>;
 	cap-mmc-highspeed;
 	cap-sd-highspeed;
