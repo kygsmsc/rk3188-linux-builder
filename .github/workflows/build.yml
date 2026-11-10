@@ -239,7 +239,7 @@ jobs:
         find arch/${ARCH}/boot/dts -name "*.dtb" -exec cp {} "$GITHUB_WORKSPACE/dtb_out/" \; 2>/dev/null || true
         cp "arch/${ARCH}/boot/${KERNEL_IMAGE}" "$GITHUB_WORKSPACE/${KERNEL_IMAGE}" 2>/dev/null || true
 
-    - name: 8. 打包瑞芯微刷机所需镜像 (使用 rkcrc 签名)
+    - name: 8. 打包瑞芯微刷机所需镜像 (使用原生 CRCC 签名)
       run: |
         FINAL_DIR="rk-flash-${DEVICE_MODEL}-Ubuntu_${UBUNTU_VERSION}-K${KERNEL_VERSION}"
         mkdir -p "$FINAL_DIR"
@@ -265,21 +265,61 @@ jobs:
           echo "正在拼接 zImage-dtb..."
           cat "${KERNEL_IMAGE}" "${DTB_FILE}" > zImage-dtb
           
-          echo "使用标准 mkbootimg 生成临时镜像..."
-          dd if=/dev/zero of=empty_ramdisk bs=1M count=1
-          mkbootimg --kernel zImage-dtb --ramdisk empty_ramdisk -o boot.img-raw
-          rm -f empty_ramdisk
+          echo "正在使用 C 代码内联编译 rkcrc 工具..."
+          cat << 'EOF' > rkcrc.c
+        #include <stdio.h>
+        #include <stdlib.h>
+        #include <string.h>
+        #include <stdint.h>
 
-          # ！！！关键修复：使用 Rockchip 专用工具 rkcrc 进行签名 ！！！
-          echo "正在下载 rkcrc 工具..."
-          wget -q https://github.com/rockchip-linux/tools/raw/master/linux/rkcrc -O rkcrc
-          chmod +x rkcrc
+        uint32_t crc_table[256];
+        void make_crc_table() {
+            for (int n = 0; n < 256; n++) {
+                uint32_t c = (uint32_t)n;
+                for (int k = 0; k < 8; k++) {
+                    if (c & 1) c = 0xedb88320L ^ (c >> 1);
+                    else c = c >> 1;
+                }
+                crc_table[n] = c;
+            }
+        }
+        uint32_t crc32(uint32_t crc, const uint8_t *buf, size_t len) {
+            crc = crc ^ 0xffffffffL;
+            for (size_t i = 0; i < len; i++) {
+                crc = crc_table[(crc ^ buf[i]) & 0xff] ^ (crc >> 8);
+            }
+            return crc ^ 0xffffffffL;
+        }
+        int main(int argc, char **argv) {
+            if (argc != 3) return 1;
+            make_crc_table();
+            FILE *f = fopen(argv[1], "rb");
+            if (!f) return 1;
+            fseek(f, 0, SEEK_END);
+            long size = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            uint8_t *buf = malloc(size);
+            fread(buf, 1, size, f);
+            fclose(f);
+            uint32_t crc = crc32(0, buf, size);
+            FILE *out = fopen(argv[2], "wb");
+            uint32_t hdr[3];
+            memcpy(hdr, "CRCC", 4);
+            hdr[1] = size + 4;
+            hdr[2] = crc;
+            fwrite(hdr, 4, 3, out);
+            fwrite(buf, 1, size, out);
+            fclose(out);
+            free(buf);
+            return 0;
+        }
+        EOF
+          gcc rkcrc.c -o rkcrc
+          chmod +x rkcrc          
+          echo "直接对 zImage-dtb 进行 CRCC 签名生成 boot.img..."
+          ./rkcrc zImage-dtb "$FINAL_DIR/boot.img"
           
-          echo "使用 rkcrc 对 boot.img 进行签名..."
-          ./rkcrc boot.img-raw "$FINAL_DIR/boot.img"
-          
-          # 清理临时文件
-          rm -f boot.img-raw rkcrc
+          rm -f zImage-dtb rkcrc rkcrc.c
         else
           echo "❌ 错误：缺少内核或 DTB，无法生成 boot.img"
           exit 1
@@ -308,13 +348,8 @@ jobs:
         使用瑞芯微开发工具(RKDevTool)刷机:
         1. 选择 Loader (你的原厂 loader)
         2. 选择 parameter.txt
-        3. 选择 boot.img (已使用 rkcrc 签名)
+        3. 选择 boot.img (已进行 CRCC 签名，老 Loader 直接识别)
         4. 选择 rootfs.img
-        
-        备注: 
-        - 串口已切换至 ttyS2 并启用 earlycon。
-        - 已强制开启 maxcpus=1 防止老芯片 SMP 死锁。
-        - boot.img 已使用 Rockchip rkcrc 工具签名，以兼容原厂 Loader。
         EOF
 
         ZIP_NAME="${FINAL_DIR}.zip"
