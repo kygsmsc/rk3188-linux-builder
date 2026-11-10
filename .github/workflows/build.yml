@@ -67,9 +67,9 @@ on:
         default: 'current'
 
       base_url:
-        description: 'Ubuntu Base 下载根前缀'
+        description: 'Ubuntu Base 下载根前缀（保持默认即可）'
         required: false
-        default: 'https://cdimage.ubuntu.com/ubuntu-base/releases/20.04/release'
+        default: 'https://cdimage.ubuntu.com/ubuntu-base/releases'
 
       mirror:
         description: 'apt 软件源镜像'
@@ -182,15 +182,18 @@ jobs:
 
         if [ "${DISTRO}" = "ubuntu" ]; then
           BASE_FILE="ubuntu-base-${UBUNTU_VERSION}-base-${UBUNTU_ARCH}.tar.gz"
-          BASE_FULL_URL="${BASE_URL}/${CODENAME}/release/${BASE_FILE}"
+          
+          # 强制使用统一的官方拼接逻辑，无视你在输入框里填的变体
+          REAL_BASE_URL="https://cdimage.ubuntu.com/ubuntu-base/releases/${CODENAME}/release"
+          BASE_FULL_URL="${REAL_BASE_URL}/${BASE_FILE}"
           
           if [ ! -s "cache/${BASE_FILE}" ]; then
             wget --no-check-certificate -q --tries=3 --timeout=60 -O "cache/${BASE_FILE}.tmp" "${BASE_FULL_URL}" || true
             if [ ! -s "cache/${BASE_FILE}.tmp" ]; then
-              AVAILABLE=$(wget -q -O - "${BASE_URL}/${CODENAME}/release/" 2>/dev/null | grep -oE "ubuntu-base-[0-9]+\.[0-9]+\.[0-9]+-base-${UBUNTU_ARCH}\.tar\.gz" | sort -V | tail -1)
+              AVAILABLE=$(wget -q -O - "${REAL_BASE_URL}/" 2>/dev/null | grep -oE "ubuntu-base-[0-9]+\.[0-9]+\.[0-9]+-base-${UBUNTU_ARCH}\.tar\.gz" | sort -V | tail -1)
               [ -z "$AVAILABLE" ] && { echo "❌ 找不到可用 Ubuntu Base"; exit 1; }
               BASE_FILE="$AVAILABLE"
-              BASE_FULL_URL="${BASE_URL}/${CODENAME}/release/${BASE_FILE}"
+              BASE_FULL_URL="${REAL_BASE_URL}/${BASE_FILE}"
               wget --no-check-certificate -q --tries=5 --timeout=120 "${BASE_FULL_URL}" -O "cache/${BASE_FILE}"
             else
               mv "cache/${BASE_FILE}.tmp" "cache/${BASE_FILE}"
@@ -222,12 +225,13 @@ jobs:
 
     - name: 6. 调用现有 lib 脚本构建纯净 rootfs
       run: |
-        # 强制使用 usb 模式输出到 usb_pure_rootfs
         export MODE=usb
         export ROOTFS_DIR="$PWD/usb_pure_rootfs"
         export TARGET_HOSTNAME="${DEVICE_MODEL}"
+        # 这里同样把绝对正确的路径传给你的神仙脚本
+        export BASE_URL="https://cdimage.ubuntu.com/ubuntu-base/releases/${CODENAME}/release"
+        
         chmod +x build_rootfs.sh lib/*.sh
-        # 直接执行你的神仙脚本
         sudo -E ./build_rootfs.sh
         
         echo "========== 你的 rootfs 构建完毕 =========="
@@ -241,52 +245,42 @@ jobs:
         tar xf "${KERNEL_TARBALL}"
         cd "linux-${KERNEL_VERSION}"
 
-        # 生成 defconfig
         if [ "${ARCH}" = "arm64" ] && [ -f "arch/arm64/configs/rockchip_defconfig" ]; then
           make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" rockchip_defconfig
         else
           make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" defconfig
         fi
 
-        # ！！！关键 1：把你的 dts 拷入源码树 ！！！
         echo "复制自定义 dts 到内核源码树..."
         mkdir -p arch/${ARCH}/boot/dts/rockchip
         cp $GITHUB_WORKSPACE/dts/*.dts arch/${ARCH}/boot/dts/rockchip/ 2>/dev/null || true
         cp $GITHUB_WORKSPACE/dts/*.dts arch/${ARCH}/boot/dts/ 2>/dev/null || true
 
-        # 编译内核、设备树和模块
         make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" -j$(nproc) "${KERNEL_IMAGE}"
         make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" -j$(nproc) dtbs
         make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" -j$(nproc) modules
 
-        # ！！！关键 2：显式点名编译你的 dts，防止内核 Makefile 忽略它 ！！！
         echo "显式编译自定义 DTS..."
         for dts_file in $GITHUB_WORKSPACE/dts/*.dts; do
           if [ -f "$dts_file" ]; then
             DTS_NAME=$(basename "$dts_file" .dts)
             echo "尝试编译: ${DTS_NAME}.dtb"
-            # 尝试在 rockchip 子目录编译（优先）
             make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" -j$(nproc) rockchip/${DTS_NAME}.dtb 2>/dev/null || true
-            # 尝试在根 dts 目录编译（兜底）
             make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" -j$(nproc) ${DTS_NAME}.dtb 2>/dev/null || true
           fi
         done
 
         sudo make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" INSTALL_MOD_PATH="$GITHUB_WORKSPACE/usb_pure_rootfs" modules_install
 
-        # 收集生成的 DTB 供打包
         mkdir -p "$GITHUB_WORKSPACE/dtb_out"
         find arch/${ARCH}/boot/dts -name "*.dtb" -exec cp {} "$GITHUB_WORKSPACE/dtb_out/" \; 2>/dev/null || true
-        
-        # 把 zImage/Image 拿出来
         cp "arch/${ARCH}/boot/${KERNEL_IMAGE}" "$GITHUB_WORKSPACE/${KERNEL_IMAGE}" 2>/dev/null || true
 
-    - name: 8. 打包瑞芯微刷机所需镜像 (boot.img, rootfs.img, parameter.txt)
+    - name: 8. 打包瑞芯微刷机所需镜像
       run: |
         FINAL_DIR="rk-flash-${DEVICE_MODEL}-Ubuntu_${UBUNTU_VERSION}-K${KERNEL_VERSION}"
         mkdir -p "$FINAL_DIR"
         
-        # 1. 制作 rootfs.img (Ext4 格式)
         echo "开始制作 rootfs.img (大小 ${ROOTFS_SIZE})..."
         truncate -s "${ROOTFS_SIZE}" "$FINAL_DIR/rootfs.img"
         mkfs.ext4 -F -L rootfs "$FINAL_DIR/rootfs.img"
@@ -296,13 +290,9 @@ jobs:
         sudo umount mnt_rootfs
         rmdir mnt_rootfs
 
-        # 2. 把单独导出的 dtb 也放进压缩包，方便用户提取
-        # ！！！关键 3：将 dtb_out 里的文件全部拷贝到最终包里 ！！！
         mkdir -p "$FINAL_DIR/dtb"
         cp dtb_out/*.dtb "$FINAL_DIR/dtb/" 2>/dev/null || echo "⚠️ 未找到任何 dtb"
 
-        # 3. 制作 boot.img (包含 zImage/Image 与 DTB)
-        # 默认选取匹配设备型号的 dtb，匹配不到则选第一个
         DTB_FILE=$(ls dtb_out/*${DEVICE_MODEL}*.dtb 2>/dev/null | head -1)
         if [ -z "$DTB_FILE" ]; then
           DTB_FILE=$(ls dtb_out/*.dtb 2>/dev/null | head -1)
@@ -310,7 +300,6 @@ jobs:
         
         if [ -n "$DTB_FILE" ] && [ -f "${KERNEL_IMAGE}" ]; then
           echo "正在使用 ${DTB_FILE} 与 ${KERNEL_IMAGE} 打包 boot.img..."
-          # 生成一个 1MB 的假空 ramdisk，防止部分版本 mkbootimg 因为 ramdisk 为空报错
           dd if=/dev/zero of=empty_ramdisk bs=1M count=1
           mkbootimg --kernel "${KERNEL_IMAGE}" --dtb "${DTB_FILE}" --ramdisk empty_ramdisk -o "$FINAL_DIR/boot.img"
           rm -f empty_ramdisk
@@ -319,7 +308,6 @@ jobs:
           exit 1
         fi
 
-        # 4. 生成 parameter.txt (4G eMMC 最简分区表)
         cat > "$FINAL_DIR/parameter.txt" << 'EOF'
         FIRMWARE_VER:8.1.0
         MACHINE_MODEL:RK3188
@@ -335,7 +323,6 @@ jobs:
         UUID: 614e0000-0000-4b53-8000-1d28000054a9
         EOF
 
-        # 5. 写个说明
         cat > "$FINAL_DIR/README.txt" << EOF
         设备型号: ${DEVICE_MODEL}
         架构: ${ARCH}
@@ -350,17 +337,19 @@ jobs:
         备注: dtb 目录下已保留单独生成的设备树文件。
         EOF
 
+        # ！！！关键修复：真正给当前 shell 的 ZIP_NAME 赋值 ！！！
+        ZIP_NAME="${FINAL_DIR}.zip"
         cd "$FINAL_DIR"
-        zip -q -r "../${FINAL_DIR}.zip" .
+        zip -q -r "../${ZIP_NAME}" .
         cd ..
-        echo "ZIP_NAME=${FINAL_DIR}.zip" >> "$GITHUB_ENV"
+        echo "ZIP_NAME=${ZIP_NAME}" >> "$GITHUB_ENV"
         ls -lh "$ZIP_NAME"
 
     - name: 9. 上传到 Releases
       uses: softprops/action-gh-release@v2
       with:
-        tag_name: build-${{ github.run_number }}-${DEVICE_MODEL}
-        name: "Rockchip ${DEVICE_MODEL} Ubuntu 刷机包 (Kernel ${KERNEL_VERSION})"
+        tag_name: build-${{ github.run_number }}-${{ inputs.device_model }}
+        name: "Rockchip ${{ inputs.device_model }} Ubuntu 刷机包 (Kernel ${{ inputs.kernel_version }})"
         files: |
           ${{ env.ZIP_NAME }}
       env:
