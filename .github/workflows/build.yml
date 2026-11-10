@@ -299,9 +299,12 @@ jobs:
         fi
         
         if [ -n "$DTB_FILE" ] && [ -f "${KERNEL_IMAGE}" ]; then
-          echo "正在使用 ${DTB_FILE} 与 ${KERNEL_IMAGE} 打包 boot.img..."
+          echo "正在将 DTB 追加到 zImage 生成 zImage-dtb..."
+          cat "${KERNEL_IMAGE}" "${DTB_FILE}" > zImage-dtb
+  
+          echo "使用 zImage-dtb 打包 boot.img..."
           dd if=/dev/zero of=empty_ramdisk bs=1M count=1
-          mkbootimg --kernel "${KERNEL_IMAGE}" --dtb "${DTB_FILE}" --ramdisk empty_ramdisk -o "$FINAL_DIR/boot.img"
+          mkbootimg --kernel zImage-dtb --ramdisk empty_ramdisk -o "$FINAL_DIR/boot.img"
           rm -f empty_ramdisk
         else
           echo "❌ 错误：缺少内核或 DTB，无法生成 boot.img"
