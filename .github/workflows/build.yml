@@ -183,7 +183,6 @@ jobs:
         if [ "${DISTRO}" = "ubuntu" ]; then
           BASE_FILE="ubuntu-base-${UBUNTU_VERSION}-base-${UBUNTU_ARCH}.tar.gz"
           
-          # 强制使用统一的官方拼接逻辑，无视你在输入框里填的变体
           REAL_BASE_URL="https://cdimage.ubuntu.com/ubuntu-base/releases/${CODENAME}/release"
           BASE_FULL_URL="${REAL_BASE_URL}/${BASE_FILE}"
           
@@ -228,7 +227,6 @@ jobs:
         export MODE=usb
         export ROOTFS_DIR="$PWD/usb_pure_rootfs"
         export TARGET_HOSTNAME="${DEVICE_MODEL}"
-        # 这里同样把绝对正确的路径传给你的神仙脚本
         export BASE_URL="https://cdimage.ubuntu.com/ubuntu-base/releases/${CODENAME}/release"
         
         chmod +x build_rootfs.sh lib/*.sh
@@ -298,10 +296,11 @@ jobs:
           DTB_FILE=$(ls dtb_out/*.dtb 2>/dev/null | head -1)
         fi
         
+        # ！！！关键修改：用 cat 拼接 zImage-dtb，适配老 Bootloader ！！！
         if [ -n "$DTB_FILE" ] && [ -f "${KERNEL_IMAGE}" ]; then
           echo "正在将 DTB 追加到 zImage 生成 zImage-dtb..."
           cat "${KERNEL_IMAGE}" "${DTB_FILE}" > zImage-dtb
-  
+          
           echo "使用 zImage-dtb 打包 boot.img..."
           dd if=/dev/zero of=empty_ramdisk bs=1M count=1
           mkbootimg --kernel zImage-dtb --ramdisk empty_ramdisk -o "$FINAL_DIR/boot.img"
@@ -311,7 +310,7 @@ jobs:
           exit 1
         fi
 
-        # ！！！关键修改：替换为你确认过的 parameter.txt 内容，串口已改为 ttyS0 ！！！
+        # ！！！修改：加入 maxcpus=1 防止老芯片死锁，并保留 ttyS0 ！！！
         cat > "$FINAL_DIR/parameter.txt" << 'EOF'
         FIRMWARE_VER:4.2.2
         MACHINE_MODEL:LaDesk 110
@@ -323,7 +322,7 @@ jobs:
         CHECK_MASK:0x80
         KERNEL_IMG:0x60408000
         #RECOVER_KEY:1,1,0,20,0
-        CMDLINE:console=ttyS0,115200 root=/dev/block/mtd/by-name/rootfs rw rootfstype=ext4 init=/sbin/init mtdparts=rk29xxnand:0x00008000@0x00002000(boot),-@0x0000A000(rootfs) dwc_driver=2
+        CMDLINE:console=ttyS0,115200 maxcpus=1 root=/dev/block/mtd/by-name/rootfs rw rootfstype=ext4 init=/sbin/init mtdparts=rk29xxnand:0x00008000@0x00002000(boot),-@0x0000A000(rootfs) dwc_driver=2
         EOF
 
         cat > "$FINAL_DIR/README.txt" << EOF
