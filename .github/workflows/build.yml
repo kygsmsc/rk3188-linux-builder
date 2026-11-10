@@ -308,19 +308,19 @@ jobs:
           exit 1
         fi
 
+        # ！！！关键修改：替换为你确认过的 parameter.txt 内容，串口已改为 ttyS0 ！！！
         cat > "$FINAL_DIR/parameter.txt" << 'EOF'
-        FIRMWARE_VER:8.1.0
-        MACHINE_MODEL:RK3188
+        FIRMWARE_VER:4.2.2
+        MACHINE_MODEL:LaDesk 110
         MACHINE_ID:007
-        MANUFACTURER: RK3188
-        MAGIC: 0x5041524B
-        ATAG: 0x00200800
-        MACHINE: 0xffffffff
-        CHECK_MASK: 0x80
-        PWR_HLD: 0,0,A,0,1
-        TYPE: GPT
-        CMDLINE: mtdparts=rk29xxnand:0x00002000@0x00004000(uboot),0x00002000@0x00006000(trust),0x00010000@0x00008000(boot),0x00080000@0x00018000(rootfs),-@0x00098000(userdata)
-        UUID: 614e0000-0000-4b53-8000-1d28000054a9
+        MANUFACTURER:RK31SDK
+        MAGIC:0x5041524B
+        ATAG:0x60000800
+        MACHINE:3066
+        CHECK_MASK:0x80
+        KERNEL_IMG:0x60408000
+        #RECOVER_KEY:1,1,0,20,0
+        CMDLINE:console=ttyS0,115200 root=/dev/block/mtd/by-name/rootfs rw rootfstype=ext4 init=/sbin/init mtdparts=rk29xxnand:0x00008000@0x00002000(boot),-@0x0000A000(rootfs) dwc_driver=2
         EOF
 
         cat > "$FINAL_DIR/README.txt" << EOF
@@ -334,10 +334,12 @@ jobs:
         3. 选择 boot.img
         4. 选择 rootfs.img
         
-        备注: dtb 目录下已保留单独生成的设备树文件。
+        备注: 
+        - dtb 目录下已保留单独生成的设备树文件。
+        - 串口日志波特率已配置为 115200 (ttyS0)。
+        - 根文件系统分区使用 by-name 定位。
         EOF
 
-        # ！！！关键修复：真正给当前 shell 的 ZIP_NAME 赋值 ！！！
         ZIP_NAME="${FINAL_DIR}.zip"
         cd "$FINAL_DIR"
         zip -q -r "../${ZIP_NAME}" .
