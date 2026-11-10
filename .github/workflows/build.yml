@@ -148,14 +148,15 @@ jobs:
 
         # ---------- 发行版相关变量 ----------
         if [ "${DISTRO}" = "ubuntu" ]; then
-          UBUNTU_SERIES=$(echo "${UBUNTU_VERSION}" | cut -d. -f1-2)
-          echo "UBUNTU_SERIES=${UBUNTU_SERIES}" >> "$GITHUB_ENV"
+          # Ubuntu 统一用官方代号作为目录名（focal / jammy / noble），
+          # 避免 cdimage.ubuntu.com 上 22.04 与 jammy 双路径混用造成的不稳定
           case "${UBUNTU_VERSION}" in
-            20.04.*) echo "CODENAME=focal" >> "$GITHUB_ENV" ;;
-            22.04.*) echo "CODENAME=jammy" >> "$GITHUB_ENV" ;;
-            24.04.*) echo "CODENAME=noble" >> "$GITHUB_ENV" ;;
+            20.04.*) CODENAME="focal" ;;
+            22.04.*) CODENAME="jammy" ;;
+            24.04.*) CODENAME="noble" ;;
             *) echo "❌ 不支持的 Ubuntu 版本: ${UBUNTU_VERSION}"; exit 1 ;;
           esac
+          echo "CODENAME=${CODENAME}" >> "$GITHUB_ENV"
 
         elif [ "${DISTRO}" = "debian" ]; then
           echo "CODENAME=${DEBIAN_CODENAME}" >> "$GITHUB_ENV"
@@ -191,25 +192,44 @@ jobs:
 
         if [ "${DISTRO}" = "ubuntu" ]; then
           # ================= Ubuntu Base (.tar.gz) =================
+          # 目录使用官方代号（jammy / focal / noble），与 cdimage 实际布局一致
           BASE_FILE="ubuntu-base-${UBUNTU_VERSION}-base-${UBUNTU_ARCH}.tar.gz"
-          BASE_FULL_URL="${BASE_URL}/${UBUNTU_SERIES}/release/${BASE_FILE}"
+          BASE_FULL_URL="${BASE_URL}/${CODENAME}/release/${BASE_FILE}"
           echo "Ubuntu Base 下载: ${BASE_FULL_URL}"
 
-          if [ ! -f "cache/${BASE_FILE}" ]; then
-            if ! wget --no-check-certificate -q --tries=3 --timeout=60 \
-                 -O "cache/${BASE_FILE}.tmp" "${BASE_FULL_URL}"; then
+          if [ ! -s "cache/${BASE_FILE}" ]; then
+            # 先尝试精确版本；无论 wget 返回码如何，都以文件非空为成功判据
+            wget --no-check-certificate -q --tries=3 --timeout=60 \
+              -O "cache/${BASE_FILE}.tmp" "${BASE_FULL_URL}" || true
+
+            if [ ! -s "cache/${BASE_FILE}.tmp" ]; then
+              echo "⚠️ 直接下载失败或文件为空，从目录列表匹配最新可用 patch 版本..."
               rm -f "cache/${BASE_FILE}.tmp"
-              echo "⚠️ 精确版本不存在，从目录匹配最新 patch..."
-              AVAILABLE=$(wget -q -O - "${BASE_URL}/${UBUNTU_SERIES}/release/" 2>/dev/null \
-                | grep -oE "ubuntu-base-${UBUNTU_SERIES}\.[0-9]+-base-${UBUNTU_ARCH}\.tar\.gz" \
+              AVAILABLE=$(wget -q -O - "${BASE_URL}/${CODENAME}/release/" 2>/dev/null \
+                | grep -oE "ubuntu-base-[0-9]+\.[0-9]+\.[0-9]+-base-${UBUNTU_ARCH}\.tar\.gz" \
                 | sort -V | tail -1)
-              [ -z "$AVAILABLE" ] && { echo "❌ 找不到可用 Ubuntu Base"; exit 1; }
+              if [ -z "$AVAILABLE" ]; then
+                echo "❌ 无法在 ${BASE_URL}/${CODENAME}/release/ 找到 ${UBUNTU_ARCH} 的 Ubuntu Base"
+                exit 1
+              fi
               BASE_FILE="$AVAILABLE"
-              BASE_FULL_URL="${BASE_URL}/${UBUNTU_SERIES}/release/${BASE_FILE}"
+              BASE_FULL_URL="${BASE_URL}/${CODENAME}/release/${BASE_FILE}"
+              echo "改用: ${BASE_FILE}"
               wget --no-check-certificate -q --tries=5 --timeout=120 \
-                "${BASE_FULL_URL}" -O "cache/${BASE_FILE}"
+                "${BASE_FULL_URL}" -O "cache/${BASE_FILE}" || {
+                echo "❌ 回退下载仍失败: ${BASE_FULL_URL}"
+                exit 1
+              }
+            else
+              mv "cache/${BASE_FILE}.tmp" "cache/${BASE_FILE}"
             fi
           fi
+
+          if [ ! -s "cache/${BASE_FILE}" ]; then
+            echo "❌ 文件最终不存在或为空: cache/${BASE_FILE}"
+            exit 1
+          fi
+          ls -lh "cache/${BASE_FILE}"
           sudo tar -xpf "cache/${BASE_FILE}" -C usb_pure_rootfs
           echo "BASE_FILE=${BASE_FILE}" >> "$GITHUB_ENV"
 
@@ -226,7 +246,11 @@ jobs:
           echo "Debian rootfs 下载: ${DEBIAN_URL}"
 
           wget --no-check-certificate -q --tries=5 --timeout=300 \
-            -O "cache/debian-${CODENAME}-${UBUNTU_ARCH}.tar.xz" "${DEBIAN_URL}"
+            -O "cache/debian-${CODENAME}-${UBUNTU_ARCH}.tar.xz" "${DEBIAN_URL}" || true
+          if [ ! -s "cache/debian-${CODENAME}-${UBUNTU_ARCH}.tar.xz" ]; then
+            echo "❌ Debian rootfs 下载失败"
+            exit 1
+          fi
           sudo tar -xJpf "cache/debian-${CODENAME}-${UBUNTU_ARCH}.tar.xz" -C usb_pure_rootfs
           echo "DEBIAN_DATE=${LATEST_DATE}" >> "$GITHUB_ENV"
 
@@ -238,7 +262,11 @@ jobs:
           echo "Armbian 镜像下载: ${ARMBIAN_URL}"
 
           wget --no-check-certificate -q --tries=5 --timeout=600 \
-            -O cache/armbian.img.xz "${ARMBIAN_URL}"
+            -O cache/armbian.img.xz "${ARMBIAN_URL}" || true
+          if [ ! -s cache/armbian.img.xz ]; then
+            echo "❌ Armbian 镜像下载失败"
+            exit 1
+          fi
 
           xz -dkc cache/armbian.img.xz > cache/armbian.img
 
@@ -409,11 +437,9 @@ jobs:
 
         DTB_DIR="arch/${ARCH}/boot/dts/rockchip"
         if [ -d "$DTB_DIR" ]; then
-          # 优先精确匹配设备名
           find "$DTB_DIR" -name "*${DEVICE_MODEL}*.dtb" -exec cp {} "$DTB_OUT/" \; 2>/dev/null || true
         fi
 
-        # 如果精确匹配为空，收集 rockchip 目录全部 dtb
         if [ -z "$(ls -A "$DTB_OUT" 2>/dev/null)" ] && [ -d "$DTB_DIR" ]; then
           echo "⚠️ 未找到与 ${DEVICE_MODEL} 精确匹配的 dtb，收集 rockchip 目录全部 dtb"
           find "$DTB_DIR" -name "*.dtb" -exec cp {} "$DTB_OUT/" \; 2>/dev/null || true
