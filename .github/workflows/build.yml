@@ -1,10 +1,10 @@
-name: 编译 Rockchip 多发行版 Ubuntu/Debian/Armbian 包（含 dtb）
+name: 编译 Rockchip 刷机包 (复用 lib 和 dts)
 
 on:
   workflow_dispatch:
     inputs:
       distro:
-        description: 'rootfs 发行版'
+        description: 'rootfs 发行版 (目前 lib 脚本仅完美兼容 Ubuntu)'
         required: true
         type: choice
         options:
@@ -14,7 +14,7 @@ on:
         default: 'ubuntu'
 
       device_model:
-        description: '设备型号（rockchip 系列）'
+        description: '设备型号'
         required: true
         type: choice
         options:
@@ -24,15 +24,15 @@ on:
           - rk3528
           - rk3566
           - rk3588
-        default: 'rk3588'
+        default: 'rk3188'
 
       kernel_version:
-        description: '内核版本（从 kernel.org 下载 tarball，如 6.12.116）'
+        description: '内核版本（从 kernel.org 下载）'
         required: true
         default: '6.12.116'
 
       ubuntu_version:
-        description: 'Ubuntu Base 版本（distro=ubuntu 时必填；debian/armbian 时忽略）'
+        description: 'Ubuntu Base 版本'
         required: false
         type: choice
         options:
@@ -42,22 +42,22 @@ on:
         default: '22.04.5'
 
       debian_codename:
-        description: 'Debian 代号（distro=debian 时使用，如 bookworm / trixie）'
+        description: 'Debian 代号（若选 debian）'
         required: false
         default: 'bookworm'
 
       armbian_board:
-        description: 'Armbian 板子名（distro=armbian 时使用，如 rock-5b）'
+        description: 'Armbian 板子名（若选 armbian）'
         required: false
         default: 'rock-5b'
 
       armbian_release:
-        description: 'Armbian 发行代号（如 bookworm / trixie / noble）'
+        description: 'Armbian 发行代号（若选 armbian）'
         required: false
         default: 'bookworm'
 
       armbian_branch:
-        description: 'Armbian 分支（current / edge / vendor）'
+        description: 'Armbian 分支（若选 armbian）'
         required: false
         type: choice
         options:
@@ -67,12 +67,12 @@ on:
         default: 'current'
 
       base_url:
-        description: 'Ubuntu Base 下载根前缀（distro=ubuntu 时使用）'
+        description: 'Ubuntu Base 下载根前缀'
         required: false
         default: 'https://cdimage.ubuntu.com/ubuntu-base/releases'
 
       mirror:
-        description: 'apt 软件源镜像（Ubuntu 适用；Debian 默认 deb.debian.org）'
+        description: 'apt 软件源镜像'
         required: false
         default: 'http://repo.huaweicloud.com/ubuntu-ports'
 
@@ -82,12 +82,12 @@ on:
         default: 'root123'
 
       custom_mac:
-        description: '自定义 eth0 MAC（留空则用设备原生）'
+        description: '自定义 eth0 MAC（留空则用原生）'
         required: false
         default: ''
 
       minimal_mode:
-        description: '精简 B 级（yes = 移除 htop/bash-completion 等）'
+        description: '精简 B 级（yes = 移除 htop/bash-completion）'
         required: false
         type: choice
         options:
@@ -95,11 +95,16 @@ on:
           - 'yes'
         default: 'no'
 
+      rootfs_size:
+        description: 'rootfs.img 镜像大小 (例如 2G, 4G)'
+        required: true
+        default: '2G'
+
 permissions:
   contents: write
 
 jobs:
-  build-multi-distro:
+  build-rockchip:
     runs-on: ubuntu-22.04
     timeout-minutes: 180
 
@@ -117,14 +122,14 @@ jobs:
       ROOT_PASSWORD: ${{ inputs.root_password }}
       CUSTOM_MAC: ${{ inputs.custom_mac }}
       MINIMAL_MODE: ${{ inputs.minimal_mode }}
+      ROOTFS_SIZE: ${{ inputs.rootfs_size }}
 
     steps:
     - name: 1. 检出代码
       uses: actions/checkout@v4
 
-    - name: 2. 解析架构、工具链与发行版变量
+    - name: 2. 解析架构与工具链
       run: |
-        # ---------- 架构与工具链 ----------
         case "${DEVICE_MODEL}" in
           rk3188|rk3288)
             echo "ARCH=arm" >> "$GITHUB_ENV"
@@ -140,42 +145,27 @@ jobs:
             echo "UBUNTU_ARCH=arm64" >> "$GITHUB_ENV"
             echo "QEMU_STATIC=qemu-aarch64-static" >> "$GITHUB_ENV"
             ;;
-          *)
-            echo "❌ 不支持的设备: ${DEVICE_MODEL}"
-            exit 1
-            ;;
+          *) echo "❌ 不支持的设备"; exit 1 ;;
         esac
 
-        # ---------- 发行版相关变量 ----------
         if [ "${DISTRO}" = "ubuntu" ]; then
-          # Ubuntu 统一用官方代号作为目录名（focal / jammy / noble），
-          # 避免 cdimage.ubuntu.com 上 22.04 与 jammy 双路径混用造成的不稳定
           case "${UBUNTU_VERSION}" in
-            20.04.*) CODENAME="focal" ;;
-            22.04.*) CODENAME="jammy" ;;
-            24.04.*) CODENAME="noble" ;;
-            *) echo "❌ 不支持的 Ubuntu 版本: ${UBUNTU_VERSION}"; exit 1 ;;
+            20.04.*) echo "CODENAME=focal" >> "$GITHUB_ENV" ;;
+            22.04.*) echo "CODENAME=jammy" >> "$GITHUB_ENV" ;;
+            24.04.*) echo "CODENAME=noble" >> "$GITHUB_ENV" ;;
           esac
-          echo "CODENAME=${CODENAME}" >> "$GITHUB_ENV"
-
         elif [ "${DISTRO}" = "debian" ]; then
           echo "CODENAME=${DEBIAN_CODENAME}" >> "$GITHUB_ENV"
-          # Debian 使用 deb.debian.org，除非用户手动改了 mirror
-          if [ "${MIRROR}" = "http://repo.huaweicloud.com/ubuntu-ports" ]; then
-            echo "MIRROR=http://deb.debian.org/debian" >> "$GITHUB_ENV"
-          fi
-
-        elif [ "${DISTRO}" = "armbian" ]; then
+        else
           echo "CODENAME=armbian" >> "$GITHUB_ENV"
-          # Armbian 自带 APT 源，第 6 步会跳过 sources.list 重写
         fi
 
-    - name: 3. 安装依赖与交叉编译工具链
+    - name: 3. 安装编译与打包依赖
       run: |
         sudo apt-get update -qq
         sudo apt-get install -y -qq \
           build-essential flex bison libssl-dev libelf-dev bc rsync \
-          qemu-user-static e2fsprogs zip xz-utils kpartx \
+          qemu-user-static e2fsprogs zip xz-utils kpartx mkbootimg android-sdk-libsparse-utils \
           gcc-arm-linux-gnueabihf gcc-aarch64-linux-gnu
 
     - name: 4. 缓存 rootfs
@@ -184,362 +174,193 @@ jobs:
         path: cache/*
         key: rootfs-${{ env.DISTRO }}-${{ env.UBUNTU_VERSION || env.DEBIAN_CODENAME || env.ARMBIAN_RELEASE }}-${{ env.UBUNTU_ARCH }}
 
-    - name: 5. 下载并解压 rootfs（按发行版分支）
+    - name: 5. 下载并解压 rootfs (送入 usb_pure_rootfs)
       run: |
         mkdir -p cache
         rm -rf usb_pure_rootfs
         mkdir -p usb_pure_rootfs
 
         if [ "${DISTRO}" = "ubuntu" ]; then
-          # ================= Ubuntu Base (.tar.gz) =================
-          # 目录使用官方代号（jammy / focal / noble），与 cdimage 实际布局一致
           BASE_FILE="ubuntu-base-${UBUNTU_VERSION}-base-${UBUNTU_ARCH}.tar.gz"
           BASE_FULL_URL="${BASE_URL}/${CODENAME}/release/${BASE_FILE}"
-          echo "Ubuntu Base 下载: ${BASE_FULL_URL}"
-
+          
           if [ ! -s "cache/${BASE_FILE}" ]; then
-            # 先尝试精确版本；无论 wget 返回码如何，都以文件非空为成功判据
-            wget --no-check-certificate -q --tries=3 --timeout=60 \
-              -O "cache/${BASE_FILE}.tmp" "${BASE_FULL_URL}" || true
-
+            wget --no-check-certificate -q --tries=3 --timeout=60 -O "cache/${BASE_FILE}.tmp" "${BASE_FULL_URL}" || true
             if [ ! -s "cache/${BASE_FILE}.tmp" ]; then
-              echo "⚠️ 直接下载失败或文件为空，从目录列表匹配最新可用 patch 版本..."
-              rm -f "cache/${BASE_FILE}.tmp"
-              AVAILABLE=$(wget -q -O - "${BASE_URL}/${CODENAME}/release/" 2>/dev/null \
-                | grep -oE "ubuntu-base-[0-9]+\.[0-9]+\.[0-9]+-base-${UBUNTU_ARCH}\.tar\.gz" \
-                | sort -V | tail -1)
-              if [ -z "$AVAILABLE" ]; then
-                echo "❌ 无法在 ${BASE_URL}/${CODENAME}/release/ 找到 ${UBUNTU_ARCH} 的 Ubuntu Base"
-                exit 1
-              fi
+              AVAILABLE=$(wget -q -O - "${BASE_URL}/${CODENAME}/release/" 2>/dev/null | grep -oE "ubuntu-base-[0-9]+\.[0-9]+\.[0-9]+-base-${UBUNTU_ARCH}\.tar\.gz" | sort -V | tail -1)
+              [ -z "$AVAILABLE" ] && { echo "❌ 找不到可用 Ubuntu Base"; exit 1; }
               BASE_FILE="$AVAILABLE"
               BASE_FULL_URL="${BASE_URL}/${CODENAME}/release/${BASE_FILE}"
-              echo "改用: ${BASE_FILE}"
-              wget --no-check-certificate -q --tries=5 --timeout=120 \
-                "${BASE_FULL_URL}" -O "cache/${BASE_FILE}" || {
-                echo "❌ 回退下载仍失败: ${BASE_FULL_URL}"
-                exit 1
-              }
+              wget --no-check-certificate -q --tries=5 --timeout=120 "${BASE_FULL_URL}" -O "cache/${BASE_FILE}"
             else
               mv "cache/${BASE_FILE}.tmp" "cache/${BASE_FILE}"
             fi
           fi
-
-          if [ ! -s "cache/${BASE_FILE}" ]; then
-            echo "❌ 文件最终不存在或为空: cache/${BASE_FILE}"
-            exit 1
-          fi
-          ls -lh "cache/${BASE_FILE}"
           sudo tar -xpf "cache/${BASE_FILE}" -C usb_pure_rootfs
-          echo "BASE_FILE=${BASE_FILE}" >> "$GITHUB_ENV"
 
         elif [ "${DISTRO}" = "debian" ]; then
-          # ================= Debian KernelCI (full.rootfs.tar.xz) =================
           DEBIAN_BASE="https://storage.kernelci.org/images/rootfs/debian/${CODENAME}"
-          echo "获取 Debian ${CODENAME} 最新构建日期..."
-          LATEST_DATE=$(wget -q -O - "${DEBIAN_BASE}/" 2>/dev/null \
-            | grep -oE '[0-9]{8}\.[0-9]+' | sort -V | tail -1)
-          [ -z "$LATEST_DATE" ] && { echo "❌ 找不到 Debian ${CODENAME} 的可用构建"; exit 1; }
-
-          DEBIAN_FILE="full.rootfs.tar.xz"
-          DEBIAN_URL="${DEBIAN_BASE}/${LATEST_DATE}/${UBUNTU_ARCH}/${DEBIAN_FILE}"
-          echo "Debian rootfs 下载: ${DEBIAN_URL}"
-
-          wget --no-check-certificate -q --tries=5 --timeout=300 \
-            -O "cache/debian-${CODENAME}-${UBUNTU_ARCH}.tar.xz" "${DEBIAN_URL}" || true
-          if [ ! -s "cache/debian-${CODENAME}-${UBUNTU_ARCH}.tar.xz" ]; then
-            echo "❌ Debian rootfs 下载失败"
-            exit 1
-          fi
-          sudo tar -xJpf "cache/debian-${CODENAME}-${UBUNTU_ARCH}.tar.xz" -C usb_pure_rootfs
-          echo "DEBIAN_DATE=${LATEST_DATE}" >> "$GITHUB_ENV"
+          LATEST_DATE=$(wget -q -O - "${DEBIAN_BASE}/" 2>/dev/null | grep -oE '[0-9]{8}\.[0-9]+' | sort -V | tail -1)
+          [ -z "$LATEST_DATE" ] && { echo "❌ 找不到 Debian 构建"; exit 1; }
+          DEBIAN_URL="${DEBIAN_BASE}/${LATEST_DATE}/${UBUNTU_ARCH}/full.rootfs.tar.xz"
+          wget --no-check-certificate -q --tries=5 --timeout=300 -O "cache/debian.tar.xz" "${DEBIAN_URL}"
+          sudo tar -xJpf "cache/debian.tar.xz" -C usb_pure_rootfs
 
         elif [ "${DISTRO}" = "armbian" ]; then
-          # ================= Armbian 完整镜像 → 提取 rootfs =================
-          # dl.armbian.com 的友好重定向路径：{board}/{Release}_{Branch}_minimal
-          ARMBIAN_RELEASE_CAP=$(echo "${ARMBIAN_RELEASE}" | sed 's/^./\U&/')  # bookworm -> Bookworm
+          ARMBIAN_RELEASE_CAP=$(echo "${ARMBIAN_RELEASE}" | sed 's/^./\U&/')
           ARMBIAN_URL="https://dl.armbian.com/${ARMBIAN_BOARD}/${ARMBIAN_RELEASE_CAP}_${ARMBIAN_BRANCH}_minimal"
-          echo "Armbian 镜像下载: ${ARMBIAN_URL}"
-
-          wget --no-check-certificate -q --tries=5 --timeout=600 \
-            -O cache/armbian.img.xz "${ARMBIAN_URL}" || true
-          if [ ! -s cache/armbian.img.xz ]; then
-            echo "❌ Armbian 镜像下载失败"
-            exit 1
-          fi
-
+          wget --no-check-certificate -q --tries=5 --timeout=600 -O cache/armbian.img.xz "${ARMBIAN_URL}"
           xz -dkc cache/armbian.img.xz > cache/armbian.img
-
-          # 用 loop + kpartx 映射分区
-          sudo apt-get install -y -qq kpartx > /dev/null 2>&1
           LOOP=$(sudo losetup -fP --show cache/armbian.img)
-          echo "Loop 设备: ${LOOP}"
-
-          # 等待分区出现
           sleep 2
-          ROOT_PART=$(sudo lsblk -lnpo NAME,SIZE "$LOOP" \
-            | sort -k2 -n | tail -1 | awk '{print $1}')
-          if [ -z "$ROOT_PART" ] || [ "$ROOT_PART" = "$LOOP" ]; then
-            # 回退：用 kpartx 创建 /dev/mapper 节点
-            sudo kpartx -as "$LOOP"
-            MAPPER=$(sudo ls /dev/mapper/ | grep "$(basename "$LOOP")" | sort -V | tail -1)
-            ROOT_PART="/dev/mapper/${MAPPER}"
-          fi
-
-          if [ -z "$ROOT_PART" ] || [ ! -b "$ROOT_PART" ]; then
-            echo "❌ 无法识别 Armbian 镜像中的 rootfs 分区"
-            sudo losetup -d "$LOOP" 2>/dev/null || true
-            exit 1
-          fi
-
-          echo "rootfs 分区: ${ROOT_PART}"
-          sudo mkdir -p /mnt/armbian-root
-          sudo mount -o ro "$ROOT_PART" /mnt/armbian-root
-          sudo cp -a /mnt/armbian-root/. usb_pure_rootfs/
-          sudo umount /mnt/armbian-root
-          sudo kpartx -d "$LOOP" 2>/dev/null || true
-          sudo losetup -d "$LOOP" 2>/dev/null || true
-          sudo rm -rf /mnt/armbian-root
-
-          echo "✅ 从 Armbian 镜像提取 rootfs 完成"
+          ROOT_PART=$(sudo lsblk -lnpo NAME,SIZE "$LOOP" | sort -k2 -n | tail -1 | awk '{print $1}')
+          sudo mount -o ro "$ROOT_PART" /mnt
+          sudo cp -a /mnt/. usb_pure_rootfs/
+          sudo umount /mnt
+          sudo losetup -d "$LOOP"
         fi
 
-        echo "========== rootfs 准备完成 =========="
-        sudo du -sh usb_pure_rootfs
-        sudo ls -la usb_pure_rootfs/ | head -20
-
-    - name: 6. 配置 rootfs（密码 / apt / ssh / 网络 / MAC / 精简）
+    - name: 6. 调用现有 lib 脚本构建纯净 rootfs
       run: |
-        ROOTFS="$PWD/usb_pure_rootfs"
+        # 强制使用 usb 模式输出到 usb_pure_rootfs
+        export MODE=usb
+        export ROOTFS_DIR="$PWD/usb_pure_rootfs"
+        export TARGET_HOSTNAME="${DEVICE_MODEL}"
+        chmod +x build_rootfs.sh lib/*.sh
+        # 直接执行你的神仙脚本
+        sudo -E ./build_rootfs.sh
+        
+        echo "========== 你的 rootfs 构建完毕 =========="
+        sudo du -sh usb_pure_rootfs
 
-        # 确保关键挂载点存在
-        sudo mkdir -p "$ROOTFS/proc" "$ROOTFS/sys" "$ROOTFS/dev/pts"
-
-        # qemu 静态二进制
-        if [ -f "/usr/bin/${QEMU_STATIC}" ]; then
-          sudo cp "/usr/bin/${QEMU_STATIC}" "$ROOTFS/usr/bin/"
-        fi
-
-        sudo cp /etc/resolv.conf "$ROOTFS/etc/resolv.conf"
-        sudo mount -t proc /proc "$ROOTFS/proc"
-        sudo mount -t sysfs /sys "$ROOTFS/sys"
-        sudo mount --bind /dev "$ROOTFS/dev"
-        sudo mount --bind /dev/pts "$ROOTFS/dev/pts"
-
-        # ---------- APT 源（Ubuntu / Debian 重写；Armbian 跳过）----------
-        if [ "${DISTRO}" = "ubuntu" ]; then
-          sudo tee "$ROOTFS/etc/apt/sources.list" > /dev/null << EOF
-        deb ${MIRROR}/ ${CODENAME} main restricted universe multiverse
-        deb ${MIRROR}/ ${CODENAME}-updates main restricted universe multiverse
-        deb ${MIRROR}/ ${CODENAME}-backports main restricted universe multiverse
-        EOF
-        elif [ "${DISTRO}" = "debian" ]; then
-          sudo tee "$ROOTFS/etc/apt/sources.list" > /dev/null << EOF
-        deb ${MIRROR} ${CODENAME} main contrib non-free
-        deb ${MIRROR} ${CODENAME}-updates main contrib non-free
-        deb ${MIRROR}-security ${CODENAME}-security main contrib non-free
-        EOF
-        elif [ "${DISTRO}" = "armbian" ]; then
-          echo "Armbian 自带 APT 源，跳过 sources.list 重写"
-        fi
-
-        # ---------- root 密码 ----------
-        if [ -n "${ROOT_PASSWORD}" ]; then
-          sudo chroot "$ROOTFS" /bin/bash -c \
-            "echo 'root:${ROOT_PASSWORD}' | chpasswd" 2>/dev/null \
-            || echo "⚠️ 密码设置跳过（rootfs 可能缺少 passwd）"
-        fi
-
-        # ---------- hostname ----------
-        echo "${DEVICE_MODEL}" | sudo tee "$ROOTFS/etc/hostname" > /dev/null
-        {
-          echo "127.0.0.1 localhost"
-          echo "127.0.1.1 ${DEVICE_MODEL}"
-        } | sudo tee "$ROOTFS/etc/hosts" > /dev/null
-
-        # ---------- 安装基础软件（尽力而为，失败不阻塞）----------
-        sudo chroot "$ROOTFS" /bin/bash -c "
-          export DEBIAN_FRONTEND=noninteractive
-          apt-get update -qq 2>/dev/null || true
-          apt-get install -y -qq --no-install-recommends \
-            openssh-server network-manager wpasupplicant iw rfkill \
-            tzdata locales sudo vim ca-certificates 2>/dev/null || true
-        " || echo "⚠️ 部分软件安装失败，继续"
-
-        # ---------- 时区 + locale ----------
-        sudo chroot "$ROOTFS" /bin/bash -c "
-          [ -f /usr/share/zoneinfo/Asia/Shanghai ] && \
-            ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
-            echo 'Asia/Shanghai' > /etc/timezone
-          sed -i 's/^# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen 2>/dev/null || true
-          locale-gen 2>/dev/null || true
-          echo 'LANG=en_US.UTF-8' > /etc/default/locale
-        " || true
-
-        # ---------- 自定义 MAC ----------
-        if [ -n "${CUSTOM_MAC}" ]; then
-          sudo mkdir -p "$ROOTFS/etc/NetworkManager/conf.d"
-          sudo tee "$ROOTFS/etc/NetworkManager/conf.d/00-mac.conf" > /dev/null << EOF
-        [connection]
-        ethernet.cloned-mac-address=${CUSTOM_MAC}
-        EOF
-          echo "✅ eth0 MAC 设为: ${CUSTOM_MAC}"
-        fi
-
-        # ---------- 精简 B 级 ----------
-        if [ "${MINIMAL_MODE}" = "yes" ]; then
-          sudo chroot "$ROOTFS" /bin/bash -c "
-            apt-get remove -y --purge htop bash-completion 2>/dev/null || true
-            apt-get autoremove -y 2>/dev/null || true
-          " || true
-          sudo rm -rf "$ROOTFS/usr/share/consolefonts" \
-                      "$ROOTFS/usr/share/keymaps" \
-                      "$ROOTFS/usr/lib/udev/hwdb.bin" 2>/dev/null || true
-          echo "✅ 精简 B 级完成"
-        fi
-
-        # ---------- 清理 ----------
-        sudo rm -f "$ROOTFS/usr/bin/${QEMU_STATIC}"
-        sudo umount -lf "$ROOTFS/dev/pts" 2>/dev/null || true
-        sudo umount -lf "$ROOTFS/dev" 2>/dev/null || true
-        sudo umount -lf "$ROOTFS/sys" 2>/dev/null || true
-        sudo umount -lf "$ROOTFS/proc" 2>/dev/null || true
-        sudo du -sh "$ROOTFS"
-
-    - name: 7. 从 kernel.org 下载并编译内核、模块与 dtb
+    - name: 7. 编译内核、DTS 与模块
       run: |
         KERNEL_MAJOR=$(echo "${KERNEL_VERSION}" | cut -d. -f1)
         KERNEL_TARBALL="linux-${KERNEL_VERSION}.tar.xz"
-        KERNEL_URL="https://cdn.kernel.org/pub/linux/kernel/v${KERNEL_MAJOR}.x/${KERNEL_TARBALL}"
-
-        echo "下载内核源码: ${KERNEL_URL}"
-        wget -q --show-progress "${KERNEL_URL}" -O "${KERNEL_TARBALL}"
+        wget -q --show-progress "https://cdn.kernel.org/pub/linux/kernel/v${KERNEL_MAJOR}.x/${KERNEL_TARBALL}" -O "${KERNEL_TARBALL}"
         tar xf "${KERNEL_TARBALL}"
         cd "linux-${KERNEL_VERSION}"
 
-        # defconfig：Rockchip 设备优先用 rockchip_defconfig（如果存在）
+        # 生成 defconfig
         if [ "${ARCH}" = "arm64" ] && [ -f "arch/arm64/configs/rockchip_defconfig" ]; then
           make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" rockchip_defconfig
         else
           make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" defconfig
         fi
 
+        # ！！！关键 1：把你的 dts 拷入源码树 ！！！
+        echo "复制自定义 dts 到内核源码树..."
+        mkdir -p arch/${ARCH}/boot/dts/rockchip
+        cp $GITHUB_WORKSPACE/dts/*.dts arch/${ARCH}/boot/dts/rockchip/ 2>/dev/null || true
+        cp $GITHUB_WORKSPACE/dts/*.dts arch/${ARCH}/boot/dts/ 2>/dev/null || true
+
+        # 编译内核、设备树和模块
         make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" -j$(nproc) "${KERNEL_IMAGE}"
         make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" -j$(nproc) dtbs
         make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" -j$(nproc) modules
 
-        sudo make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" \
-             INSTALL_MOD_PATH="$GITHUB_WORKSPACE/usb_pure_rootfs" modules_install
+        # ！！！关键 2：显式点名编译你的 dts，防止内核 Makefile 忽略它 ！！！
+        echo "显式编译自定义 DTS..."
+        for dts_file in $GITHUB_WORKSPACE/dts/*.dts; do
+          if [ -f "$dts_file" ]; then
+            DTS_NAME=$(basename "$dts_file" .dts)
+            echo "尝试编译: ${DTS_NAME}.dtb"
+            # 尝试在 rockchip 子目录编译（优先）
+            make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" -j$(nproc) rockchip/${DTS_NAME}.dtb 2>/dev/null || true
+            # 尝试在根 dts 目录编译（兜底）
+            make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" -j$(nproc) ${DTS_NAME}.dtb 2>/dev/null || true
+          fi
+        done
 
-        # ---------- 收集 dtb ----------
-        DTB_OUT="$GITHUB_WORKSPACE/dtb"
-        rm -rf "$DTB_OUT"; mkdir -p "$DTB_OUT"
+        sudo make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" INSTALL_MOD_PATH="$GITHUB_WORKSPACE/usb_pure_rootfs" modules_install
 
-        DTB_DIR="arch/${ARCH}/boot/dts/rockchip"
-        if [ -d "$DTB_DIR" ]; then
-          find "$DTB_DIR" -name "*${DEVICE_MODEL}*.dtb" -exec cp {} "$DTB_OUT/" \; 2>/dev/null || true
-        fi
-
-        if [ -z "$(ls -A "$DTB_OUT" 2>/dev/null)" ] && [ -d "$DTB_DIR" ]; then
-          echo "⚠️ 未找到与 ${DEVICE_MODEL} 精确匹配的 dtb，收集 rockchip 目录全部 dtb"
-          find "$DTB_DIR" -name "*.dtb" -exec cp {} "$DTB_OUT/" \; 2>/dev/null || true
-        fi
-
+        # 收集生成的 DTB 供打包
+        mkdir -p "$GITHUB_WORKSPACE/dtb_out"
+        find arch/${ARCH}/boot/dts -name "*.dtb" -exec cp {} "$GITHUB_WORKSPACE/dtb_out/" \; 2>/dev/null || true
+        
+        # 把 zImage/Image 拿出来
         cp "arch/${ARCH}/boot/${KERNEL_IMAGE}" "$GITHUB_WORKSPACE/${KERNEL_IMAGE}" 2>/dev/null || true
 
-        echo "========== 收集到的 dtb =========="
-        ls -lh "$DTB_OUT" | head -30
-        echo "dtb 总数: $(ls -1 "$DTB_OUT" 2>/dev/null | wc -l)"
-
-    - name: 8. 打包 rootfs + dtb + 内核
+    - name: 8. 打包瑞芯微刷机所需镜像 (boot.img, rootfs.img, parameter.txt)
       run: |
-        FINAL_DIR="Rockchip-${DEVICE_MODEL}-${DISTRO^}-K${KERNEL_VERSION}"
-        rm -rf "$FINAL_DIR"
-        mkdir -p "$FINAL_DIR/rootfs" "$FINAL_DIR/dtb" "$FINAL_DIR/boot"
+        FINAL_DIR="rk-flash-${DEVICE_MODEL}-Ubuntu_${UBUNTU_VERSION}-K${KERNEL_VERSION}"
+        mkdir -p "$FINAL_DIR"
+        
+        # 1. 制作 rootfs.img (Ext4 格式)
+        echo "开始制作 rootfs.img (大小 ${ROOTFS_SIZE})..."
+        truncate -s "${ROOTFS_SIZE}" "$FINAL_DIR/rootfs.img"
+        mkfs.ext4 -F -L rootfs "$FINAL_DIR/rootfs.img"
+        mkdir -p mnt_rootfs
+        sudo mount -o loop "$FINAL_DIR/rootfs.img" mnt_rootfs
+        sudo cp -a usb_pure_rootfs/. mnt_rootfs/
+        sudo umount mnt_rootfs
+        rmdir mnt_rootfs
 
-        sudo tar -I 'xz -T0' -cpf "$FINAL_DIR/rootfs/rootfs-${UBUNTU_ARCH}.tar.xz" -C usb_pure_rootfs .
+        # 2. 把单独导出的 dtb 也放进压缩包，方便用户提取
+        # ！！！关键 3：将 dtb_out 里的文件全部拷贝到最终包里 ！！！
+        mkdir -p "$FINAL_DIR/dtb"
+        cp dtb_out/*.dtb "$FINAL_DIR/dtb/" 2>/dev/null || echo "⚠️ 未找到任何 dtb"
 
-        if [ -d dtb ] && [ -n "$(ls -A dtb 2>/dev/null)" ]; then
-          cp -a dtb/. "$FINAL_DIR/dtb/"
+        # 3. 制作 boot.img (包含 zImage/Image 与 DTB)
+        # 默认选取匹配设备型号的 dtb，匹配不到则选第一个
+        DTB_FILE=$(ls dtb_out/*${DEVICE_MODEL}*.dtb 2>/dev/null | head -1)
+        if [ -z "$DTB_FILE" ]; then
+          DTB_FILE=$(ls dtb_out/*.dtb 2>/dev/null | head -1)
+        fi
+        
+        if [ -n "$DTB_FILE" ] && [ -f "${KERNEL_IMAGE}" ]; then
+          echo "正在使用 ${DTB_FILE} 与 ${KERNEL_IMAGE} 打包 boot.img..."
+          # 生成一个 1MB 的假空 ramdisk，防止部分版本 mkbootimg 因为 ramdisk 为空报错
+          dd if=/dev/zero of=empty_ramdisk bs=1M count=1
+          mkbootimg --kernel "${KERNEL_IMAGE}" --dtb "${DTB_FILE}" --ramdisk empty_ramdisk -o "$FINAL_DIR/boot.img"
+          rm -f empty_ramdisk
+        else
+          echo "❌ 错误：缺少内核或 DTB，无法生成 boot.img"
+          exit 1
         fi
 
-        cp "${KERNEL_IMAGE}" "$FINAL_DIR/boot/" 2>/dev/null || true
+        # 4. 生成 parameter.txt (4G eMMC 最简分区表)
+        cat > "$FINAL_DIR/parameter.txt" << 'EOF'
+FIRMWARE_VER:8.1.0
+MACHINE_MODEL:RK3188
+MACHINE_ID:007
+MANUFACTURER: RK3188
+MAGIC: 0x5041524B
+ATAG: 0x00200800
+MACHINE: 0xffffffff
+CHECK_MASK: 0x80
+PWR_HLD: 0,0,A,0,1
+TYPE: GPT
+CMDLINE: mtdparts=rk29xxnand:0x00002000@0x00004000(uboot),0x00002000@0x00006000(trust),0x00010000@0x00008000(boot),0x00080000@0x00018000(rootfs),-@0x00098000(userdata)
+UUID: 614e0000-0000-4b53-8000-1d28000054a9
+EOF
 
-        # 发行版信息摘要
-        DISTRO_INFO=""
-        if [ "${DISTRO}" = "ubuntu" ]; then
-          DISTRO_INFO="Ubuntu ${UBUNTU_VERSION} (${CODENAME})"
-        elif [ "${DISTRO}" = "debian" ]; then
-          DISTRO_INFO="Debian ${CODENAME} (KernelCI ${DEBIAN_DATE:-latest})"
-        elif [ "${DISTRO}" = "armbian" ]; then
-          DISTRO_INFO="Armbian ${ARMBIAN_RELEASE} ${ARMBIAN_BRANCH} (${ARMBIAN_BOARD})"
-        fi
-
+        # 5. 写个说明
         cat > "$FINAL_DIR/README.txt" << EOF
-        设备型号:   ${DEVICE_MODEL}
-        架构:       ${ARCH} / ${UBUNTU_ARCH}
-        内核版本:   ${KERNEL_VERSION}（kernel.org 官方源码）
-        rootfs:     ${DISTRO_INFO}
-        apt 镜像:   ${MIRROR}
-        root 密码:  ${ROOT_PASSWORD:-未设置}
-        自定义 MAC: ${CUSTOM_MAC:-设备原生}
-        精简模式:   ${MINIMAL_MODE}
-        构建时间:   $(date '+%Y-%m-%d %H:%M:%S')
-
-        包内结构:
-          boot/${KERNEL_IMAGE}                   — 内核镜像
-          dtb/*.dtb                              — 设备树文件
-          rootfs/rootfs-${UBUNTU_ARCH}.tar.xz    — 根文件系统
-
-        刷机提示:
-          1. 按板子分区规划将 rootfs 解压到 rootfs 分区
-          2. 将 boot/${KERNEL_IMAGE} 与对应 dtb 放入 boot 分区
-          3. 首次登录用户 root，密码见上
+        设备型号: ${DEVICE_MODEL}
+        架构: ${ARCH}
+        内核版本: ${KERNEL_VERSION}
+        
+        使用瑞芯微开发工具(RKDevTool)刷机:
+        1. 选择 Loader (你的原厂 loader)
+        2. 选择 parameter.txt
+        3. 选择 boot.img
+        4. 选择 rootfs.img
+        
+        备注: dtb 目录下已保留单独生成的设备树文件。
         EOF
 
-        ZIP_NAME="${FINAL_DIR}.zip"
-        zip -q -r "$ZIP_NAME" "$FINAL_DIR"
-        echo "ZIP_NAME=${ZIP_NAME}" >> "$GITHUB_ENV"
-        echo "FINAL_DIR=${FINAL_DIR}" >> "$GITHUB_ENV"
-        echo "DISTRO_INFO=${DISTRO_INFO}" >> "$GITHUB_ENV"
-
-        echo "========== 最终包内容 =========="
+        cd "$FINAL_DIR"
+        zip -q -r "../${FINAL_DIR}.zip" .
+        cd ..
+        echo "ZIP_NAME=${FINAL_DIR}.zip" >> "$GITHUB_ENV"
         ls -lh "$ZIP_NAME"
-        unzip -l "$ZIP_NAME" | head -40
 
-    - name: 9. 上传 Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: ${{ env.ZIP_NAME }}
-        path: ${{ env.ZIP_NAME }}
-        retention-days: 7
-        if-no-files-found: error
-
-    - name: 10. 同步到 GitHub Releases
+    - name: 9. 上传到 Releases
       uses: softprops/action-gh-release@v2
       with:
-        tag_name: rockchip-${{ inputs.distro }}-v${{ github.run_number }}-${{ inputs.device_model }}-k${{ inputs.kernel_version }}
-        name: "Rockchip ${{ inputs.device_model }} ${{ env.DISTRO_INFO }} (Kernel ${{ inputs.kernel_version }})"
-        body: |
-          ## Rockchip 多发行版构建
-
-          | 项目 | 内容 |
-          |---|---|
-          | 设备 | `${{ inputs.device_model }}` |
-          | 架构 | `${{ env.ARCH }}` / `${{ env.UBUNTU_ARCH }}` |
-          | rootfs | `${{ env.DISTRO_INFO }}` |
-          | 内核 | `${{ inputs.kernel_version }}`（kernel.org） |
-          | apt 镜像 | `${{ inputs.mirror }}` |
-          | 精简模式 | `${{ inputs.minimal_mode }}` |
-
-          ### 包内结构
-          - `boot/` — 内核镜像
-          - `dtb/` — 设备树文件（精确匹配优先，否则全收集）
-          - `rootfs/rootfs-*.tar.xz` — 根文件系统
-
-          ### 账号信息
-          - 用户名：`root`
-          - 初始密码：`${{ inputs.root_password }}`
+        tag_name: build-${{ github.run_number }}-${DEVICE_MODEL}
+        name: "Rockchip ${DEVICE_MODEL} Ubuntu 刷机包 (Kernel ${KERNEL_VERSION})"
         files: |
           ${{ env.ZIP_NAME }}
       env:
