@@ -69,7 +69,7 @@ on:
       base_url:
         description: 'Ubuntu Base 下载根前缀'
         required: false
-        default: 'https://cdimage.ubuntu.com/ubuntu-base/releases'
+        default: 'https://cdimage.ubuntu.com/ubuntu-base/releases/20.04/release'
 
       mirror:
         description: 'apt 软件源镜像'
