@@ -1,0 +1,36 @@
+# ============================================================
+# parameter.txt — RK3188 盒子 Linux（修正版）
+# 分区偏移与 RKDevTool 截图一致：boot @0x2000，rootfs @0xA000（扇区, 512B）
+# ============================================================
+FIRMWARE_VER:4.2.2
+MACHINE_MODEL:LaDesk 110
+MACHINE_ID:007
+MANUFACTURER:RK31SDK
+MAGIC:0x5041524B
+ATAG:0x60000800
+MACHINE:3066
+CHECK_MASK:0x80
+KERNEL_IMG:0x60408000
+
+# ------------------------------------------------------------
+# CMDLINE 修正点（对照原 build.yml 第 355 行）:
+#
+# 1) root= 旧写法: /dev/block/mtd/by-name/rootfs
+#    这是 Android 4.4 RK 老内核(NAND/mtd 框架)的节点；主线 6.12 + eMMC 上
+#    根本不存在。改用 root=LABEL=rootfs（rootfs.img 已用 mkfs.ext4 -L rootfs
+#    打标签，见 build.yml 打包步骤），不依赖分区编号。
+#    若内核不支持 label 挂载，可改为 root=/dev/mmcblk0p4（p 号按 eMMC 实际
+#    分区顺序：Loader/Parameter/boot/rootfs，通常 rootfs 是第 4 个分区）。
+#
+# 2) 删除 mtdparts=rk29xxnand:... ：主线内核无 rk29xxnand mtd 驱动，
+#    该参数只会产生无效警告；eMMC 分区由内核 mmc 层识别。
+#
+# 3) 增加 rootwait：等 eMMC 枚举完成再挂根，避免启动早期块设备未就绪挂根失败。
+#
+# 4) console=ttyS0：必须与 DTS 使能的串口(&uart0)、README 三者一致。
+#    若实测 TTL 接在 UART2，则 DTS 改 &uart2 status=okay、这里改 ttyS2、
+#    README 同步，三处必须一致。
+#
+# 5) 删除 dwc_driver=2：Android 老 USB 参数，主线内核不识别。
+# ------------------------------------------------------------
+CMDLINE:console=ttyS0,115200 earlycon root=LABEL=rootfs rw rootwait rootfstype=ext4 init=/sbin/init maxcpus=1
