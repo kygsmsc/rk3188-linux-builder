@@ -18,9 +18,9 @@
 	};
 
 	chosen {
-		stdout-path = "serial0:115200n8";
-		// 明确指定使用 ttyS0 控制台，与 parameter.txt 保持一致
-		bootargs = "console=ttyS0,115200 earlyprintk loglevel=8";
+    	stdout-path = "serial2:115200n8";
+    	// 将 bootargs 也改回 ttyS2，与 parameter.txt 保持一致
+    	bootargs = "console=ttyS2,115200 earlyprintk loglevel=8";
 	};
 
 	memory@60000000 {
