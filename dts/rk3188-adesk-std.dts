@@ -19,6 +19,7 @@
 
 	chosen {
 		stdout-path = "serial0:115200n8";
+		// 明确指定使用 ttyS0 控制台，与 parameter.txt 保持一致
 		bootargs = "console=ttyS0,115200 earlyprintk loglevel=8";
 	};
 
