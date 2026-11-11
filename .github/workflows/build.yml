@@ -210,42 +210,74 @@ jobs:
         chmod +x build_rootfs.sh lib/*.sh
         sudo -E ./build_rootfs.sh
 
-    - name: 7. 编译内核、DTS 与模块
+    # ============================================================
+    # 步骤 7（修正版）：编译内核 / DTB / 模块
+    #   [C1] ARM 改用 multi_v7_defconfig，并把 RK3188 启动挂根必需驱动钉为 =y
+    #   [C2] dtb 编译不吞错误：DTS 有问题必须让 CI 失败，禁止静默
+    # ============================================================
+    - name: 7. 编译内核、DTS 与模块（修正版）
       run: |
+        set -euo pipefail
         KERNEL_MAJOR=$(echo "${KERNEL_VERSION}" | cut -d. -f1)
         KERNEL_TARBALL="linux-${KERNEL_VERSION}.tar.xz"
         wget -q --show-progress "https://cdn.kernel.org/pub/linux/kernel/v${KERNEL_MAJOR}.x/${KERNEL_TARBALL}" -O "${KERNEL_TARBALL}"
         tar xf "${KERNEL_TARBALL}"
         cd "linux-${KERNEL_VERSION}"
-        if [ "${ARCH}" = "arm64" ] && [ -f "arch/arm64/configs/rockchip_defconfig" ]; then
+
+        # [C1] ARM 用 multiplatform v7 配置；ARM64 保持 rockchip_defconfig
+        if [ "${ARCH}" = "arm64" ]; then
           make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" rockchip_defconfig
         else
-          make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" defconfig
+          make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" multi_v7_defconfig
         fi
+
+        # RK3188 启动 / 挂根必需的驱动内建（=y），不要编成模块（无 initramfs）
+        scripts/config --enable CONFIG_OF_EARLY_FLATTREE
+        scripts/config --enable CONFIG_DEVTMPFS
+        scripts/config --enable CONFIG_SERIAL_8250
+        scripts/config --enable CONFIG_SERIAL_8250_OF
+        scripts/config --enable CONFIG_MMC
+        scripts/config --enable CONFIG_MMC_DW
+        scripts/config --enable CONFIG_MMC_DW_ROCKCHIP
+        scripts/config --enable CONFIG_EXT4_FS
+        scripts/config --enable CONFIG_PINCTRL_ROCKCHIP
+        scripts/config --enable CONFIG_REGULATOR_RK808
+        scripts/config --enable CONFIG_BLK_DEV_INITRD
+        make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" olddefconfig
+
         mkdir -p arch/${ARCH}/boot/dts/rockchip
-        cp $GITHUB_WORKSPACE/dts/*.dts arch/${ARCH}/boot/dts/rockchip/ 2>/dev/null || true
+        cp $GITHUB_WORKSPACE/dts/*.dts arch/${ARCH}/boot/dts/rockchip/
+
         make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" -j$(nproc) "${KERNEL_IMAGE}"
+        # [C2] dtbs 编译失败直接中断，不再 `2>/dev/null || true`
         make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" -j$(nproc) dtbs
         make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" -j$(nproc) modules
+
         for dts_file in $GITHUB_WORKSPACE/dts/*.dts; do
-          if [ -f "$dts_file" ]; then
-            DTS_NAME=$(basename "$dts_file" .dts)
-            make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" -j$(nproc) rockchip/${DTS_NAME}.dtb 2>/dev/null || true
-            make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" -j$(nproc) ${DTS_NAME}.dtb 2>/dev/null || true
-          fi
+          DTS_NAME=$(basename "$dts_file" .dts)
+          make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" -j$(nproc) rockchip/${DTS_NAME}.dtb
         done
+
         sudo make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" INSTALL_MOD_PATH="$GITHUB_WORKSPACE/usb_pure_rootfs" modules_install
         mkdir -p "$GITHUB_WORKSPACE/dtb_out"
-        find arch/${ARCH}/boot/dts -name "*.dtb" -exec cp {} "$GITHUB_WORKSPACE/dtb_out/" \; 2>/dev/null || true
-        cp "arch/${ARCH}/boot/${KERNEL_IMAGE}" "$GITHUB_WORKSPACE/${KERNEL_IMAGE}" 2>/dev/null || true
+        find arch/${ARCH}/boot/dts -name "*.dtb" -exec cp {} "$GITHUB_WORKSPACE/dtb_out/" \;
+        cp "arch/${ARCH}/boot/${KERNEL_IMAGE}" "$GITHUB_WORKSPACE/${KERNEL_IMAGE}"
 
-    - name: 8. 打包瑞芯微刷机所需镜像 (使用 mkkrnlimg)
+    # ============================================================
+    # 步骤 8（修正版）：打包刷机镜像
+    #   [C3] 使用修正版 lib/mkkrnlimg.c（CRC 在文件尾部，不再破坏 zImage 开头）
+    #   [C4] dtb 精确匹配本机型号，找不到直接报错（不再回退任意 dtb）
+    #   [C5] parameter.txt 使用仓库根目录的修正版（root=LABEL=rootfs + rootwait）
+    # ============================================================
+    - name: 8. 打包瑞芯微刷机所需镜像（修正版）
       run: |
+        set -euo pipefail
         FINAL_DIR="rk-flash-${DEVICE_MODEL}-Ubuntu_${UBUNTU_VERSION}-K${KERNEL_VERSION}"
         mkdir -p "$FINAL_DIR"
-        
+
         echo "开始制作 rootfs.img (大小 ${ROOTFS_SIZE})..."
         truncate -s "${ROOTFS_SIZE}" "$FINAL_DIR/rootfs.img"
+        # -L rootfs：与 parameter.txt 的 root=LABEL=rootfs 对应
         mkfs.ext4 -F -L rootfs "$FINAL_DIR/rootfs.img"
         mkdir -p mnt_rootfs
         sudo mount -o loop "$FINAL_DIR/rootfs.img" mnt_rootfs
@@ -254,122 +286,50 @@ jobs:
         rmdir mnt_rootfs
 
         mkdir -p "$FINAL_DIR/dtb"
-        cp dtb_out/*.dtb "$FINAL_DIR/dtb/" 2>/dev/null || echo "⚠️ 未找到任何 dtb"
+        cp dtb_out/*.dtb "$FINAL_DIR/dtb/"
 
+        # [C4] 精确匹配本机 dtb；找不到直接报错，禁止回退到目录里任意第一个 dtb
         DTB_FILE=$(ls dtb_out/*${DEVICE_MODEL}*.dtb 2>/dev/null | head -1)
-        if [ -z "$DTB_FILE" ]; then
-          DTB_FILE=$(ls dtb_out/*.dtb 2>/dev/null | head -1)
+        if [ -z "${DTB_FILE:-}" ]; then
+          echo "❌ 未找到匹配 ${DEVICE_MODEL} 的 dtb（dtb_out: $(ls dtb_out/)）"
+          exit 1
         fi
-        
-        if [ -n "$DTB_FILE" ] && [ -f "${KERNEL_IMAGE}" ]; then
-          echo "正在拼接 zImage-dtb..."
-          cat "${KERNEL_IMAGE}" "${DTB_FILE}" > zImage-dtb
-          
-          echo "正在编译并运行 mkkrnlimg 工具..."
-          # 内联编译 mkkrnlimg 工具
-          cat << 'EOF' > mkkrnlimg.c
-        #include <stdio.h>
-        #include <stdlib.h>
-        #include <string.h>
-        #include <stdint.h>
+        echo "使用 DTB: ${DTB_FILE}"
 
-        uint32_t crc_table[256];
-        void make_crc_table() {
-            for (int n = 0; n < 256; n++) {
-                uint32_t c = (uint32_t)n;
-                for (int k = 0; k < 8; k++) {
-                    if (c & 1) c = 0xedb88320L ^ (c >> 1);
-                    else c = c >> 1;
-                }
-                crc_table[n] = c;
-            }
-        }
-        uint32_t crc32(uint32_t crc, const uint8_t *buf, size_t len) {
-            crc = crc ^ 0xffffffffL;
-            for (size_t i = 0; i < len; i++) {
-                crc = crc_table[(crc ^ buf[i]) & 0xff] ^ (crc >> 8);
-            }
-            return crc ^ 0xffffffffL;
-        }
-
-        int main(int argc, char **argv) {
-            if (argc < 3) {
-                fprintf(stderr, "Usage: %s -a <input> <output>\n", argv[0]);
-                return 1;
-            }
-            make_crc_table();
-            const char *input = argv[2];
-            const char *output = argv[3];
-            
-            FILE *f = fopen(input, "rb");
-            if (!f) { perror("fopen input"); return 1; }
-            fseek(f, 0, SEEK_END);
-            long size = ftell(f);
-            fseek(f, 0, SEEK_SET);
-            uint8_t *buf = malloc(size);
-            fread(buf, 1, size, f);
-            fclose(f);
-
-            FILE *out = fopen(output, "wb");
-            if (!out) { perror("fopen output"); return 1; }
-            
-            // 写入 mkkrnlimg 格式头 (简化版，实际可能更复杂)
-            // 这里我们构造一个 Loader 能识别的 KERNEL 标签
-            uint32_t header[3];
-            memcpy(header, "KRNL", 4);
-            header[1] = size;
-            header[2] = crc32(0, buf, size);
-            
-            fwrite(header, 4, 3, out);
-            fwrite(buf, 1, size, out);
-            
-            fclose(out);
-            free(buf);
-            return 0;
-        }
-        EOF
-          gcc mkkrnlimg.c -o mkkrnlimg
-          chmod +x mkkrnlimg
-          
-          echo "使用 mkkrnlimg 封装内核镜像..."
-          ./mkkrnlimg -a zImage-dtb "$FINAL_DIR/boot.img"
-          
-          # 清理临时文件
-          rm -f zImage-dtb mkkrnlimg mkkrnlimg.c
-        else
-          echo "❌ 错误：缺少内核或 DTB，无法生成 boot.img"
+        if [ ! -f "${KERNEL_IMAGE}" ]; then
+          echo "❌ 缺少内核镜像 ${KERNEL_IMAGE}"
           exit 1
         fi
 
-        cat > "$FINAL_DIR/parameter.txt" << 'EOF'
-        FIRMWARE_VER:4.2.2
-        MACHINE_MODEL:LaDesk 110
-        MACHINE_ID:007
-        MANUFACTURER:RK31SDK
-        MAGIC:0x5041524B
-        ATAG:0x60000800
-        MACHINE:3066
-        CHECK_MASK:0x80
-        KERNEL_IMG:0x60408000
-        #RECOVER_KEY:1,1,0,20,0
-        CMDLINE:console=ttyS2,115200 earlycon maxcpus=1 root=/dev/block/mtd/by-name/rootfs rw rootfstype=ext4 init=/sbin/init mtdparts=rk29xxnand:0x00008000@0x00002000(boot),-@0x0000A000(rootfs) dwc_driver=2
-        EOF
+        # zImage + dtb 尾部拼接（主线 ARM 解压阶段扫描尾部 fdt）
+        cat "${KERNEL_IMAGE}" "${DTB_FILE}" > zImage-dtb
+
+        # [C3] 修正版封装器：tag + size + 内核 + 尾部 CRC
+        cp $GITHUB_WORKSPACE/lib/mkkrnlimg.c ./mkkrnlimg.c
+        gcc mkkrnlimg.c -o mkkrnlimg
+        chmod +x mkkrnlimg
+        ./mkkrnlimg zImage-dtb "$FINAL_DIR/boot.img"
+
+        rm -f zImage-dtb mkkrnlimg mkkrnlimg.c
+
+        # [C5] 修正版 parameter.txt（root=LABEL=rootfs rootwait，console=ttyS0）
+        cp $GITHUB_WORKSPACE/parameter.txt "$FINAL_DIR/parameter.txt"
 
         cat > "$FINAL_DIR/README.txt" << EOF
         设备型号: ${DEVICE_MODEL}
         架构: ${ARCH}
         内核版本: ${KERNEL_VERSION}
-        
+
         使用瑞芯微开发工具(RKDevTool)刷机:
         1. 选择 Loader (你的原厂 loader)
         2. 选择 parameter.txt
         3. 选择 boot.img (已使用 mkkrnlimg 格式封装)
         4. 选择 rootfs.img
-        
-        备注: 
-        - 串口已切换至 ttyS2 并启用 earlycon。
-        - 已强制开启 maxcpus=1 防止老芯片 SMP 死锁。
-        - boot.img 已使用 Rockchip mkkrnlimg 专用格式封装。
+
+        备注:
+        - 串口 ttyS0 / 115200（与 DTS &uart0、chosen bootargs 一致）
+        - rootfs 按 ext4 标签 rootfs 挂载，含 rootwait
+        - boot.img 已使用 Rockchip mkkrnlimg 格式封装
         EOF
 
         ZIP_NAME="${FINAL_DIR}.zip"
