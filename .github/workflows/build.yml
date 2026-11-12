@@ -212,7 +212,7 @@ jobs:
 
     # ============================================================
     # 步骤 7（修正版）：编译内核 / DTB / 模块
-    #   [C1] ARM 改用 multi_v7_defconfig，并把 RK3188 启动挂根必需驱动钉为 =y
+    #   [C1] ARM 使用仓库内 Armbian rk3188 defconfig（与编译教程一致）；olddefconfig 适配 6.12
     #   [C2] dtb 编译不吞错误：DTS 有问题必须让 CI 失败，禁止静默
     # ============================================================
     - name: 7. 编译内核、DTS 与模块（修正版）
@@ -224,25 +224,34 @@ jobs:
         tar xf "${KERNEL_TARBALL}"
         cd "linux-${KERNEL_VERSION}"
 
-        # [C1] ARM 用 multiplatform v7 配置；ARM64 保持 rockchip_defconfig
+        # [C1] ARM：使用仓库内 Armbian rk3188 调过的 defconfig（与编译教程一致，
+        #       含定时器/时钟/GRF/PMIC RK808/eMMC/以太网/DWC2 等全套启动驱动）；
+        #       ARM64：保持 rockchip_defconfig
         if [ "${ARCH}" = "arm64" ]; then
           make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" rockchip_defconfig
         else
-          make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" multi_v7_defconfig
+          cp $GITHUB_WORKSPACE/configs/rk3188_defconfig arch/${ARCH}/configs/rk3188_defconfig
+          make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" rk3188_defconfig
         fi
 
-        # RK3188 启动 / 挂根必需的驱动内建（=y），不要编成模块（无 initramfs）
+        # 6.12 兜底显式项（参考 config 已含大部分；这里补齐并锁定启动方式）
         scripts/config --enable CONFIG_OF_EARLY_FLATTREE
         scripts/config --enable CONFIG_DEVTMPFS
-        scripts/config --enable CONFIG_SERIAL_8250
-        scripts/config --enable CONFIG_SERIAL_8250_OF
-        scripts/config --enable CONFIG_MMC
-        scripts/config --enable CONFIG_MMC_DW
-        scripts/config --enable CONFIG_MMC_DW_ROCKCHIP
-        scripts/config --enable CONFIG_EXT4_FS
-        scripts/config --enable CONFIG_PINCTRL_ROCKCHIP
-        scripts/config --enable CONFIG_REGULATOR_RK808
         scripts/config --enable CONFIG_BLK_DEV_INITRD
+        scripts/config --enable CONFIG_ARM_APPENDED_DTB
+        scripts/config --enable CONFIG_ARM_ATAG_DTB_COMPAT
+        scripts/config --enable CONFIG_SERIAL_EARLYCON
+        # ATAG 命令行由 bootloader 传入（与参考 config 一致：FROM_BOOTLOADER）
+        scripts/config --enable CONFIG_ARM_ATAG_DTB_COMPAT_CMDLINE_FROM_BOOTLOADER
+        scripts/config --disable CONFIG_ARM_ATAG_DTB_COMPAT_CMDLINE_EXTEND
+
+        # ---- 诊断期可选（默认注释）：让内核在解压阶段就走 UART0 打印 ----
+        # 仅当“loader 已把内核拷进内存、但内核静默”时再打开；若 loader 根本没
+        # 完成加载（无 Starting kernel 行），开这里也不会有输出。稳定后可删除。
+        # scripts/config --enable CONFIG_DEBUG_LL
+        # scripts/config --enable CONFIG_DEBUG_RK3X_UART0
+        # scripts/config --enable CONFIG_DEBUG_UNCOMPRESS
+
         make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" olddefconfig
 
         mkdir -p arch/${ARCH}/boot/dts/rockchip
@@ -265,7 +274,7 @@ jobs:
 
     # ============================================================
     # 步骤 8（修正版）：打包刷机镜像
-    #   [C3] 使用修正版 lib/mkkrnlimg.c（CRC 在文件尾部，不再破坏 zImage 开头）
+    #   [C3] 使用 Rockchip mkbootimg 打 Android boot image（ANDROID! header）
     #   [C4] dtb 精确匹配本机型号，找不到直接报错（不再回退任意 dtb）
     #   [C5] parameter.txt 使用仓库根目录的修正版（root=LABEL=rootfs + rootwait）
     # ============================================================
@@ -304,13 +313,20 @@ jobs:
         # zImage + dtb 尾部拼接（主线 ARM 解压阶段扫描尾部 fdt）
         cat "${KERNEL_IMAGE}" "${DTB_FILE}" > zImage-dtb
 
-        # [C3] 修正版封装器：tag + size + 内核 + 尾部 CRC
-        cp $GITHUB_WORKSPACE/lib/mkkrnlimg.c ./mkkrnlimg.c
-        gcc mkkrnlimg.c -o mkkrnlimg
-        chmod +x mkkrnlimg
-        ./mkkrnlimg zImage-dtb "$FINAL_DIR/boot.img"
+        # 未封装的 zImage-dtb 一并放进产物，供本地 hexdump / inspect_rk_img.sh 体检
+        mkdir -p "$FINAL_DIR/unpacked"
+        cp zImage-dtb "$FINAL_DIR/unpacked/zImage-dtb"
+        cp "${KERNEL_IMAGE}" "$FINAL_DIR/unpacked/zImage"
 
-        rm -f zImage-dtb mkkrnlimg mkkrnlimg.c
+        # [C3] 用 Rockchip mkbootimg 打 Android boot image（ANDROID! header），
+        #       与编译教程一致；老 SDK loader 按 Android boot image 解析内核加载地址。
+        #       默认 kernel_addr=0x60408000，ramdisk 可省略；cmdline 由 ATAG 传入。
+        rm -rf mkbootimg-src
+        git clone --depth 1 https://github.com/neo-technologies/rockchip-mkbootimg.git mkbootimg-src
+        make -C mkbootimg-src
+        ./mkbootimg-src/mkbootimg --kernel zImage-dtb -o "$FINAL_DIR/boot.img"
+
+        rm -rf zImage-dtb mkbootimg-src
 
         # [C5] 修正版 parameter.txt（root=LABEL=rootfs rootwait，console=ttyS0）
         cp $GITHUB_WORKSPACE/parameter.txt "$FINAL_DIR/parameter.txt"
@@ -323,13 +339,14 @@ jobs:
         使用瑞芯微开发工具(RKDevTool)刷机:
         1. 选择 Loader (你的原厂 loader)
         2. 选择 parameter.txt
-        3. 选择 boot.img (已使用 mkkrnlimg 格式封装)
+        3. 选择 boot.img (Android boot image，Rockchip mkbootimg 打包)
         4. 选择 rootfs.img
 
         备注:
         - 串口 ttyS0 / 115200（与 DTS &uart0、chosen bootargs 一致）
         - rootfs 按 ext4 标签 rootfs 挂载，含 rootwait
-        - boot.img 已使用 Rockchip mkkrnlimg 格式封装
+        - boot.img 为标准 Android boot image（ANDROID! header，kernel_addr=0x60408000）
+        - unpacked/ 目录为未封装的 zImage 与 zImage-dtb，供本地 hexdump 体检
         EOF
 
         ZIP_NAME="${FINAL_DIR}.zip"
