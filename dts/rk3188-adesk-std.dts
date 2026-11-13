@@ -12,15 +12,17 @@
 	compatible = "rockchip,rk3188";
 
 	aliases {
+		/* 物理 TTL 接 UART2（0x20064000）；uart2 由 dtsi 默认 alias serial2 映射为 ttyS2 */
 		serial0 = &uart0;
+		serial2 = &uart2;
 		mmc0 = &mmc0;   /* SD 卡控制器 */
 		mmc1 = &emmc;   /* eMMC 控制器 */
 	};
 
 	chosen {
-    	stdout-path = "serial2:115200n8";
-    	// 将 bootargs 也改回 ttyS2，与 parameter.txt 保持一致
-    	bootargs = "console=ttyS2,115200 earlyprintk loglevel=8";
+		/* 修正：console/stdout 对齐物理串口 UART2（ttyS2）；原 serial0/uart0 是误改 */
+		stdout-path = "serial2:115200n8";
+		bootargs = "console=ttyS2,115200 earlyprintk loglevel=8";
 	};
 
 	memory@60000000 {
@@ -226,9 +228,13 @@
 &vop1 { status = "disabled"; };
 
 /* ========================================================
- * ！！！关键修复：显式开启 UART0，否则内核无法输出日志 ！！！
+ * 串口开启（对照实机 TTL 日志修正）
+ * 日志证据：earlycon at MMIO 0x20064000（= uart2），8250 probe 0x10124000（= uart0）；
+ * TTL 物理接在 uart2，故正式 console 用 &uart2（ttyS2）。
+ * 原代码开启的是 &uart0；现改为 &uart2，uart0 保持 dtsi 默认 disabled。
  * ======================================================== */
-&uart0 {
+/* 原始（误改）：&uart0 { status = "okay"; }; */
+&uart2 {
 	status = "okay";
 };
 
