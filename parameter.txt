@@ -49,5 +49,6 @@ KERNEL_IMG:0x60408000
 #     blkdevparts=mmcblk0:0x1000000@0x400000(boot),-@0x1400000(rootfs)
 #   并在内核配置打开 CONFIG_CMDLINE_PARTITION。
 # ------------------------------------------------------------
-CMDLINE:console=ttyS2,115200 earlycon root=LABEL=rootfs rw rootwait rootfstype=ext4 init=/sbin/init maxcpus=1 mtdparts=rk29xxnand:0x00008000@0x00002000(boot),-@0x0000A000(rootfs) dwc_driver=2
+CMDLINE:console=ttyS2,115200 earlycon root=/dev/mmcblk1p2 rw rootwait rootfstype=ext4 init=/sbin/init maxcpus=1 blkdevparts=mmcblk1:16M@4M(boot),-@20M(rootfs) mtdparts=rk29xxnand:0x00008000@0x00002000(boot),-@0x0000A000(rootfs) dwc_driver=2
+
 
