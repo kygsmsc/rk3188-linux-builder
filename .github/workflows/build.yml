@@ -328,7 +328,7 @@ jobs:
 
         rm -rf zImage-dtb mkbootimg-src
 
-        # [C5] 修正版 parameter.txt（root=LABEL=rootfs rootwait，console=ttyS0）
+        # [C5] 修正版 parameter.txt（root=LABEL=rootfs rootwait，console=ttyS2 / UART2）
         cp $GITHUB_WORKSPACE/parameter.txt "$FINAL_DIR/parameter.txt"
 
         cat > "$FINAL_DIR/README.txt" << EOF
@@ -343,7 +343,7 @@ jobs:
         4. 选择 rootfs.img
 
         备注:
-        - 串口 ttyS0 / 115200（与 DTS &uart0、chosen bootargs 一致）
+        - 串口 ttyS2 / 115200（物理 UART2，与 DTS &uart2、chosen stdout-path 一致）
         - rootfs 按 ext4 标签 rootfs 挂载，含 rootwait
         - boot.img 为标准 Android boot image（ANDROID! header，kernel_addr=0x60408000）
         - unpacked/ 目录为未封装的 zImage 与 zImage-dtb，供本地 hexdump 体检
