@@ -34,7 +34,12 @@ KERNEL_IMG:0x60408000
 # 【新增】rootwait
 #   - 等 eMMC 枚举完成再挂根，避免启动早期块设备未就绪导致挂根失败。
 #
-# 【console】ttyS0,115200：已确认 TTL 接 UART0，与 DTS &uart0、chosen bootargs 一致。
+# 【console】ttyS2,115200：TTL 实际接 UART2（MMIO 0x20064000）。
+#   日志证据：earlycon 报 "uart0 at MMIO 0x20064000"（0x20064000 即 uart2），
+#   而 8250 驱动只把 0x10124000（uart0）注册为 ttyS0；物理 TTL 能看到 earlycon
+#   阶段输出，说明接线在 uart2。原版 build.yml 第 355 行原本就是 console=ttyS2。
+#   （之前误改成 ttyS0/uart0，导致 console 切到未接线的 uart0，后续日志全部丢失，
+#     表现为"切换后假死"。此处回退到 ttyS2，与 DTS &uart2、chosen stdout-path 对齐。）
 #
 # ------------------------------------------------------------
 # 第二阶段预留（eMMC 无标准分区表时才需要）:
@@ -44,4 +49,5 @@ KERNEL_IMG:0x60408000
 #     blkdevparts=mmcblk0:0x1000000@0x400000(boot),-@0x1400000(rootfs)
 #   并在内核配置打开 CONFIG_CMDLINE_PARTITION。
 # ------------------------------------------------------------
-CMDLINE:console=ttyS0,115200 earlycon root=LABEL=rootfs rw rootwait rootfstype=ext4 init=/sbin/init maxcpus=1 mtdparts=rk29xxnand:0x00008000@0x00002000(boot),-@0x0000A000(rootfs) dwc_driver=2
+CMDLINE:console=ttyS2,115200 earlycon root=LABEL=rootfs rw rootwait rootfstype=ext4 init=/sbin/init maxcpus=1 mtdparts=rk29xxnand:0x00008000@0x00002000(boot),-@0x0000A000(rootfs) dwc_driver=2
+
