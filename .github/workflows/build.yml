@@ -244,6 +244,14 @@ jobs:
         # ATAG 命令行由 bootloader 传入（与参考 config 一致：FROM_BOOTLOADER）
         scripts/config --enable CONFIG_ARM_ATAG_DTB_COMPAT_CMDLINE_FROM_BOOTLOADER
         scripts/config --disable CONFIG_ARM_ATAG_DTB_COMPAT_CMDLINE_EXTEND
+        # 命令行分区表：eMMC 无 GPT/MBR，靠 blkdevparts 在 mmcblk1 上切出 rootfs 分区。
+        # 注意 6.12 符号名：PARTITION_ADVANCED 是 CMDLINE_PARTITION 的前置（参考 5.10
+        # config 里 PARTITION_ADVANCED 为 not set、旧符号 BLK_CMDLINE_PARSER 已在 6.12 改名）。
+        scripts/config --enable CONFIG_PARTITION_ADVANCED
+        scripts/config --enable CONFIG_CMDLINE_PARTITION
+        # 保险：eMMC 主机控制器与 ext4 必须内建（无 initramfs）
+        scripts/config --enable CONFIG_MMC_DW_ROCKCHIP
+        scripts/config --enable CONFIG_EXT4_FS
 
         # ---- 诊断期可选（默认注释）：让内核在解压阶段就走 UART0 打印 ----
         # 仅当“loader 已把内核拷进内存、但内核静默”时再打开；若 loader 根本没
@@ -276,7 +284,7 @@ jobs:
     # 步骤 8（修正版）：打包刷机镜像
     #   [C3] 使用 Rockchip mkbootimg 打 Android boot image（ANDROID! header）
     #   [C4] dtb 精确匹配本机型号，找不到直接报错（不再回退任意 dtb）
-    #   [C5] parameter.txt 使用仓库根目录的修正版（root=LABEL=rootfs + rootwait）
+    #   [C5] parameter.txt 使用仓库根目录的修正版（root=/dev/mmcblk1p2 + rootwait + blkdevparts）
     # ============================================================
     - name: 8. 打包瑞芯微刷机所需镜像（修正版）
       run: |
@@ -286,7 +294,7 @@ jobs:
 
         echo "开始制作 rootfs.img (大小 ${ROOTFS_SIZE})..."
         truncate -s "${ROOTFS_SIZE}" "$FINAL_DIR/rootfs.img"
-        # -L rootfs：与 parameter.txt 的 root=LABEL=rootfs 对应
+        # -L rootfs：ext4 标签保留备用；实际挂根走 root=/dev/mmcblk1p2（见 parameter.txt）
         mkfs.ext4 -F -L rootfs "$FINAL_DIR/rootfs.img"
         mkdir -p mnt_rootfs
         sudo mount -o loop "$FINAL_DIR/rootfs.img" mnt_rootfs
@@ -328,7 +336,7 @@ jobs:
 
         rm -rf zImage-dtb mkbootimg-src
 
-        # [C5] 修正版 parameter.txt（root=LABEL=rootfs rootwait，console=ttyS2 / UART2）
+        # [C5] 修正版 parameter.txt（root=/dev/mmcblk1p2 + rootwait + blkdevparts）
         cp $GITHUB_WORKSPACE/parameter.txt "$FINAL_DIR/parameter.txt"
 
         cat > "$FINAL_DIR/README.txt" << EOF
@@ -344,7 +352,7 @@ jobs:
 
         备注:
         - 串口 ttyS2 / 115200（物理 UART2，与 DTS &uart2、chosen stdout-path 一致）
-        - rootfs 按 ext4 标签 rootfs 挂载，含 rootwait
+        - rootfs 挂 /dev/mmcblk1p2（blkdevparts 命令行分区），含 rootwait
         - boot.img 为标准 Android boot image（ANDROID! header，kernel_addr=0x60408000）
         - unpacked/ 目录为未封装的 zImage 与 zImage-dtb，供本地 hexdump 体检
         EOF
