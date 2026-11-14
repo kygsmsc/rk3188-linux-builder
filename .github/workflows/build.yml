@@ -1,65 +1,36 @@
-name: 编译 Rockchip 刷机包 (复用 lib 和 dts)
+name: 编译 Rockchip 刷机包 (RK3188)
 
 on:
   workflow_dispatch:
     inputs:
       distro:
-        description: 'rootfs 发行版 (目前 lib 脚本仅完美兼容 Ubuntu)'
+        description: 'rootfs 发行版'
         required: true
         type: choice
-        options:
-          - ubuntu
-          - debian
-          - armbian
+        options: [ubuntu]
         default: 'ubuntu'
       device_model:
         description: '设备型号'
         required: true
         type: choice
-        options:
-          - rk3188
-          - rk3288
-          - rk3399
-          - rk3528
-          - rk3566
-          - rk3588
+        options: [rk3188, rk3288]
         default: 'rk3188'
+      board:
+        description: '板型（对应 dts 文件名，不含 .dts）'
+        required: true
+        default: 'rk3188-adesk-std'
       kernel_version:
-        description: '内核版本（从 kernel.org 下载）'
+        description: '内核版本'
         required: true
         default: '6.12.116'
       ubuntu_version:
         description: 'Ubuntu Base 版本'
         required: false
         type: choice
-        options:
-          - '20.04.5'
-          - '22.04.5'
-          - '24.04.5'
+        options: ['20.04.5', '22.04.5', '24.04.5']
         default: '22.04.5'
-      debian_codename:
-        description: 'Debian 代号（若选 debian）'
-        required: false
-        default: 'bookworm'
-      armbian_board:
-        description: 'Armbian 板子名（若选 armbian）'
-        required: false
-        default: 'rock-5b'
-      armbian_release:
-        description: 'Armbian 发行代号（若选 armbian）'
-        required: false
-        default: 'bookworm'
-      armbian_branch:
-        description: 'Armbian 分支（若选 armbian）'
-        required: false
-        type: choice
-        options:
-          - current
-          - edge
-          - vendor
-        default: 'current'
       base_url:
-        description: 'Ubuntu Base 下载根前缀（保持默认即可）'
+        description: 'Ubuntu Base 下载根前缀'
         required: false
         default: 'https://cdimage.ubuntu.com/ubuntu-base/releases'
       mirror:
@@ -71,19 +42,17 @@ on:
         required: false
         default: 'root123'
       custom_mac:
-        description: '自定义 eth0 MAC（留空则用原生）'
+        description: '自定义 eth0 MAC（留空用原生）'
         required: false
         default: ''
       minimal_mode:
-        description: '精简 B 级（yes = 移除 htop/bash-completion）'
+        description: 'C 级精简（yes = 移除 htop/bash-completion/rsyslog）'
         required: false
         type: choice
-        options:
-          - 'no'
-          - 'yes'
+        options: ['no', 'yes']
         default: 'no'
       rootfs_size:
-        description: 'rootfs.img 镜像大小 (例如 2G, 4G)'
+        description: 'rootfs.img 最小大小（实际会按内容自动放大）'
         required: true
         default: '2G'
 
@@ -93,16 +62,13 @@ permissions:
 jobs:
   build-rockchip:
     runs-on: ubuntu-22.04
-    timeout-minutes: 180
+    timeout-minutes: 240
     env:
       DISTRO: ${{ inputs.distro }}
       DEVICE_MODEL: ${{ inputs.device_model }}
+      BOARD: ${{ inputs.board }}
       KERNEL_VERSION: ${{ inputs.kernel_version }}
       UBUNTU_VERSION: ${{ inputs.ubuntu_version }}
-      DEBIAN_CODENAME: ${{ inputs.debian_codename }}
-      ARMBIAN_BOARD: ${{ inputs.armbian_board }}
-      ARMBIAN_RELEASE: ${{ inputs.armbian_release }}
-      ARMBIAN_BRANCH: ${{ inputs.armbian_branch }}
       BASE_URL: ${{ inputs.base_url }}
       MIRROR: ${{ inputs.mirror }}
       ROOT_PASSWORD: ${{ inputs.root_password }}
@@ -114,8 +80,12 @@ jobs:
     - name: 1. 检出代码
       uses: actions/checkout@v4
 
+    # ============================================================
+    # 步骤 2：解析架构、CODENAME、UBUNTU_ARCH
+    # ============================================================
     - name: 2. 解析架构与工具链
       run: |
+        set -euo pipefail
         case "${DEVICE_MODEL}" in
           rk3188|rk3288)
             echo "ARCH=arm" >> "$GITHUB_ENV"
@@ -132,90 +102,59 @@ jobs:
             echo "QEMU_STATIC=qemu-aarch64-static" >> "$GITHUB_ENV"
             ;;
         esac
-        if [ "${DISTRO}" = "ubuntu" ]; then
-          case "${UBUNTU_VERSION}" in
-            20.04.*) echo "CODENAME=focal" >> "$GITHUB_ENV" ;;
-            22.04.*) echo "CODENAME=jammy" >> "$GITHUB_ENV" ;;
-            24.04.*) echo "CODENAME=noble" >> "$GITHUB_ENV" ;;
-          esac
-        elif [ "${DISTRO}" = "debian" ]; then
-          echo "CODENAME=${DEBIAN_CODENAME}" >> "$GITHUB_ENV"
-        else
-          echo "CODENAME=armbian" >> "$GITHUB_ENV"
-        fi
+        case "${UBUNTU_VERSION}" in
+          20.04.*) echo "CODENAME=focal" >> "$GITHUB_ENV" ;;
+          22.04.*) echo "CODENAME=jammy" >> "$GITHUB_ENV" ;;
+          24.04.*) echo "CODENAME=noble" >> "$GITHUB_ENV" ;;
+          *) echo "❌ 未知 UBUNTU_VERSION: ${UBUNTU_VERSION}"; exit 1 ;;
+        esac
+        echo "✅ ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} UBUNTU_ARCH=${UBUNTU_ARCH} CODENAME=${CODENAME}"
 
+    # ============================================================
+    # 步骤 3：安装依赖
+    # ============================================================
     - name: 3. 安装编译与打包依赖
       run: |
         sudo apt-get update -qq
         sudo apt-get install -y -qq \
           build-essential flex bison libssl-dev libelf-dev bc rsync \
-          qemu-user-static e2fsprogs zip xz-utils kpartx mkbootimg android-sdk-libsparse-utils \
-          gcc-arm-linux-gnueabihf gcc-aarch64-linux-gnu libc6-i386
+          qemu-user-static e2fsprogs zip xz-utils kpartx android-sdk-libsparse-utils \
+          gcc-arm-linux-gnueabihf libc6-i386 \
+          device-tree-compiler
 
+    # ============================================================
+    # 步骤 4：缓存 rootfs
+    # ============================================================
     - name: 4. 缓存 rootfs
       uses: actions/cache@v4
       with:
         path: cache/*
-        key: rootfs-${{ env.DISTRO }}-${{ env.UBUNTU_VERSION || env.DEBIAN_CODENAME || env.ARMBIAN_RELEASE }}-${{ env.UBUNTU_ARCH }}
+        key: rootfs-${{ env.DISTRO }}-${{ env.UBUNTU_VERSION }}-${{ env.UBUNTU_ARCH }}
 
-    - name: 5. 下载并解压 rootfs
+    # ============================================================
+    # 步骤 5：构建纯净 rootfs（完全交给 lib/common.sh）
+    # ============================================================
+    - name: 5. 构建纯净 rootfs
       run: |
-        mkdir -p cache
-        rm -rf usb_pure_rootfs
-        mkdir -p usb_pure_rootfs
-        if [ "${DISTRO}" = "ubuntu" ]; then
-          BASE_FILE="ubuntu-base-${UBUNTU_VERSION}-base-${UBUNTU_ARCH}.tar.gz"
-          REAL_BASE_URL="https://cdimage.ubuntu.com/ubuntu-base/releases/${CODENAME}/release"
-          BASE_FULL_URL="${REAL_BASE_URL}/${BASE_FILE}"
-          if [ ! -s "cache/${BASE_FILE}" ]; then
-            wget --no-check-certificate -q --tries=3 --timeout=60 -O "cache/${BASE_FILE}.tmp" "${BASE_FULL_URL}" || true
-            if [ ! -s "cache/${BASE_FILE}.tmp" ]; then
-              AVAILABLE=$(wget -q -O - "${REAL_BASE_URL}/" 2>/dev/null | grep -oE "ubuntu-base-[0-9]+\.[0-9]+\.[0-9]+-base-${UBUNTU_ARCH}\.tar\.gz" | sort -V | tail -1)
-              [ -z "$AVAILABLE" ] && { echo "❌ 找不到可用 Ubuntu Base"; exit 1; }
-              BASE_FILE="$AVAILABLE"
-              BASE_FULL_URL="${REAL_BASE_URL}/${BASE_FILE}"
-              wget --no-check-certificate -q --tries=5 --timeout=120 "${BASE_FULL_URL}" -O "cache/${BASE_FILE}"
-            else
-              mv "cache/${BASE_FILE}.tmp" "cache/${BASE_FILE}"
-            fi
-          fi
-          sudo tar -xpf "cache/${BASE_FILE}" -C usb_pure_rootfs
-        elif [ "${DISTRO}" = "debian" ]; then
-          DEBIAN_BASE="https://storage.kernelci.org/images/rootfs/debian/${CODENAME}"
-          LATEST_DATE=$(wget -q -O - "${DEBIAN_BASE}/" 2>/dev/null | grep -oE '[0-9]{8}\.[0-9]+' | sort -V | tail -1)
-          [ -z "$LATEST_DATE" ] && { echo "❌ 找不到 Debian 构建"; exit 1; }
-          DEBIAN_URL="${DEBIAN_BASE}/${LATEST_DATE}/${UBUNTU_ARCH}/full.rootfs.tar.xz"
-          wget --no-check-certificate -q --tries=5 --timeout=300 -O "cache/debian.tar.xz" "${DEBIAN_URL}"
-          sudo tar -xJpf "cache/debian.tar.xz" -C usb_pure_rootfs
-        elif [ "${DISTRO}" = "armbian" ]; then
-          ARMBIAN_RELEASE_CAP=$(echo "${ARMBIAN_RELEASE}" | sed 's/^./\U&/')
-          ARMBIAN_URL="https://dl.armbian.com/${ARMBIAN_BOARD}/${ARMBIAN_RELEASE_CAP}_${ARMBIAN_BRANCH}_minimal"
-          wget --no-check-certificate -q --tries=5 --timeout=600 -O cache/armbian.img.xz "${ARMBIAN_URL}"
-          xz -dkc cache/armbian.img.xz > cache/armbian.img
-          LOOP=$(sudo losetup -fP --show cache/armbian.img)
-          sleep 2
-          ROOT_PART=$(sudo lsblk -lnpo NAME,SIZE "$LOOP" | sort -k2 -n | tail -1 | awk '{print $1}')
-          sudo mount -o ro "$ROOT_PART" /mnt
-          sudo cp -a /mnt/. usb_pure_rootfs/
-          sudo umount /mnt
-          sudo losetup -d "$LOOP"
-        fi
-
-    - name: 6. 调用 lib 脚本构建纯净 rootfs
-      run: |
+        set -euo pipefail
         export MODE=usb
         export ROOTFS_DIR="$PWD/usb_pure_rootfs"
         export TARGET_HOSTNAME="${DEVICE_MODEL}"
+        export UBUNTU_VERSION="${UBUNTU_VERSION}"
+        export UBUNTU_ARCH="${UBUNTU_ARCH}"
+        export UBUNTU_CODENAME="${CODENAME}"
         export BASE_URL="https://cdimage.ubuntu.com/ubuntu-base/releases/${CODENAME}/release"
+        export MIRROR="${MIRROR}"
+        export MINIMAL_MODE="${MINIMAL_MODE}"
+        export ROOT_PASSWORD="${ROOT_PASSWORD}"
+        export CUSTOM_MAC="${CUSTOM_MAC}"
         chmod +x build_rootfs.sh lib/*.sh
         sudo -E ./build_rootfs.sh
 
     # ============================================================
-    # 步骤 7（修正版）：编译内核 / DTB / 模块
-    #   [C1] ARM 使用仓库内 Armbian rk3188 defconfig（与编译教程一致）；olddefconfig 适配 6.12
-    #   [C2] dtb 编译不吞错误：DTS 有问题必须让 CI 失败，禁止静默
+    # 步骤 6：编译内核 / DTB / 模块
     # ============================================================
-    - name: 7. 编译内核、DTS 与模块（修正版）
+    - name: 6. 编译内核、DTS 与模块
       run: |
         set -euo pipefail
         KERNEL_MAJOR=$(echo "${KERNEL_VERSION}" | cut -d. -f1)
@@ -224,137 +163,162 @@ jobs:
         tar xf "${KERNEL_TARBALL}"
         cd "linux-${KERNEL_VERSION}"
 
-        # [C1] ARM：使用仓库内 Armbian rk3188 调过的 defconfig（与编译教程一致，
-        #       含定时器/时钟/GRF/PMIC RK808/eMMC/以太网/DWC2 等全套启动驱动）；
-        #       ARM64：保持 rockchip_defconfig
-        if [ "${ARCH}" = "arm64" ]; then
-          make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" rockchip_defconfig
-        else
-          cp $GITHUB_WORKSPACE/configs/rk3188_defconfig arch/${ARCH}/configs/rk3188_defconfig
-          make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" rk3188_defconfig
-        fi
+        # defconfig
+        cp "$GITHUB_WORKSPACE/configs/rk3188_defconfig" "arch/${ARCH}/configs/rk3188_defconfig"
+        make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" rk3188_defconfig
 
-        # 6.12 兜底显式项（参考 config 已含大部分；这里补齐并锁定启动方式）
-        scripts/config --enable CONFIG_OF_EARLY_FLATTREE
-        scripts/config --enable CONFIG_DEVTMPFS
-        scripts/config --enable CONFIG_BLK_DEV_INITRD
-        scripts/config --enable CONFIG_ARM_APPENDED_DTB
-        scripts/config --enable CONFIG_ARM_ATAG_DTB_COMPAT
-        scripts/config --enable CONFIG_SERIAL_EARLYCON
-        # ATAG 命令行由 bootloader 传入（与参考 config 一致：FROM_BOOTLOADER）
-        scripts/config --enable CONFIG_ARM_ATAG_DTB_COMPAT_CMDLINE_FROM_BOOTLOADER
+        # 6.12 关键符号
+        for sym in \
+          CONFIG_OF_EARLY_FLATTREE \
+          CONFIG_DEVTMPFS \
+          CONFIG_BLK_DEV_INITRD \
+          CONFIG_ARM_APPENDED_DTB \
+          CONFIG_ARM_ATAG_DTB_COMPAT \
+          CONFIG_SERIAL_EARLYCON \
+          CONFIG_PARTITION_ADVANCED \
+          CONFIG_CMDLINE_PARTITION \
+          CONFIG_MMC_DW_ROCKCHIP \
+          CONFIG_EXT4_FS \
+          CONFIG_EXT4_FS_POSIX_ACL \
+          CONFIG_DW_WATCHDOG ; do
+          scripts/config --enable "$sym"
+        done
+        scripts/config --enable  CONFIG_ARM_ATAG_DTB_COMPAT_CMDLINE_FROM_BOOTLOADER
         scripts/config --disable CONFIG_ARM_ATAG_DTB_COMPAT_CMDLINE_EXTEND
-        # 命令行分区表：eMMC 无 GPT/MBR，靠 blkdevparts 在 mmcblk1 上切出 rootfs 分区。
-        # 注意 6.12 符号名：PARTITION_ADVANCED 是 CMDLINE_PARTITION 的前置（参考 5.10
-        # config 里 PARTITION_ADVANCED 为 not set、旧符号 BLK_CMDLINE_PARSER 已在 6.12 改名）。
-        scripts/config --enable CONFIG_PARTITION_ADVANCED
-        scripts/config --enable CONFIG_CMDLINE_PARTITION
-        # 保险：eMMC 主机控制器与 ext4 必须内建（无 initramfs）
-        scripts/config --enable CONFIG_MMC_DW_ROCKCHIP
-        scripts/config --enable CONFIG_EXT4_FS
-
-        # ---- 诊断期可选（默认注释）：让内核在解压阶段就走 UART0 打印 ----
-        # 仅当“loader 已把内核拷进内存、但内核静默”时再打开；若 loader 根本没
-        # 完成加载（无 Starting kernel 行），开这里也不会有输出。稳定后可删除。
-        # scripts/config --enable CONFIG_DEBUG_LL
-        # scripts/config --enable CONFIG_DEBUG_RK3X_UART0
-        # scripts/config --enable CONFIG_DEBUG_UNCOMPRESS
 
         make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" olddefconfig
 
-        mkdir -p arch/${ARCH}/boot/dts/rockchip
-        cp $GITHUB_WORKSPACE/dts/*.dts arch/${ARCH}/boot/dts/rockchip/
-
-        make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" -j$(nproc) "${KERNEL_IMAGE}"
-        # [C2] dtbs 编译失败直接中断，不再 `2>/dev/null || true`
-        make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" -j$(nproc) dtbs
-        make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" -j$(nproc) modules
-
-        for dts_file in $GITHUB_WORKSPACE/dts/*.dts; do
-          DTS_NAME=$(basename "$dts_file" .dts)
-          make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" -j$(nproc) rockchip/${DTS_NAME}.dtb
+        # 校验关键符号
+        echo "===== 关键符号校验 ====="
+        for sym in \
+          CONFIG_PARTITION_ADVANCED \
+          CONFIG_MMC_DW_ROCKCHIP \
+          CONFIG_EXT4_FS ; do
+          grep -q "^${sym}=y" .config || { echo "❌ ${sym} 未启用"; exit 1; }
+          echo "  ✅ ${sym}=y"
         done
 
-        sudo make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" INSTALL_MOD_PATH="$GITHUB_WORKSPACE/usb_pure_rootfs" modules_install
+        # 编译 zImage + dtb + modules
+        mkdir -p "arch/${ARCH}/boot/dts/rockchip"
+        cp "$GITHUB_WORKSPACE/dts/"*.dts "arch/${ARCH}/boot/dts/rockchip/"
+
+        make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" -j"$(nproc)" "${KERNEL_IMAGE}"
+        make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" -j"$(nproc)" dtbs
+        make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" -j"$(nproc)" modules
+        make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" -j"$(nproc)" "rockchip/${BOARD}.dtb"
+
+        # 模块装进 rootfs + depmod
+        sudo make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" \
+          INSTALL_MOD_PATH="$GITHUB_WORKSPACE/usb_pure_rootfs" modules_install
+        sudo chroot "$GITHUB_WORKSPACE/usb_pure_rootfs" /bin/bash -c 'depmod -a 2>/dev/null || true' || true
+
+        # 收集产物
         mkdir -p "$GITHUB_WORKSPACE/dtb_out"
-        find arch/${ARCH}/boot/dts -name "*.dtb" -exec cp {} "$GITHUB_WORKSPACE/dtb_out/" \;
+        find "arch/${ARCH}/boot/dts" -name "*.dtb" -exec cp {} "$GITHUB_WORKSPACE/dtb_out/" \;
         cp "arch/${ARCH}/boot/${KERNEL_IMAGE}" "$GITHUB_WORKSPACE/${KERNEL_IMAGE}"
 
+        test -f "$GITHUB_WORKSPACE/dtb_out/${BOARD}.dtb" || { echo "❌ 找不到 ${BOARD}.dtb"; exit 1; }
+        echo "✅ 内核与 dtb 编译完成"
+
     # ============================================================
-    # 步骤 8（修正版）：打包刷机镜像
-    #   [C3] 使用 Rockchip mkbootimg 打 Android boot image（ANDROID! header）
-    #   [C4] dtb 精确匹配本机型号，找不到直接报错（不再回退任意 dtb）
-    #   [C5] parameter.txt 使用仓库根目录的修正版（root=/dev/mmcblk1p2 + rootwait + blkdevparts）
+    # 步骤 7：打包刷机镜像（路线 A：mmcblk1p1 + mtdparts）
     # ============================================================
-    - name: 8. 打包瑞芯微刷机所需镜像（修正版）
+    - name: 7. 打包刷机镜像
       run: |
         set -euo pipefail
         FINAL_DIR="rk-flash-${DEVICE_MODEL}-Ubuntu_${UBUNTU_VERSION}-K${KERNEL_VERSION}"
         mkdir -p "$FINAL_DIR"
 
-        echo "开始制作 rootfs.img (大小 ${ROOTFS_SIZE})..."
-        truncate -s "${ROOTFS_SIZE}" "$FINAL_DIR/rootfs.img"
-        # -L rootfs：ext4 标签保留备用；实际挂根走 root=/dev/mmcblk1p2（见 parameter.txt）
+        # ---- rootfs.img ----
+        ROOTFS_MB=$(sudo du -sm usb_pure_rootfs | cut -f1)
+        IMG_MB=$(( ROOTFS_MB * 130 / 100 ))
+        [ "$IMG_MB" -lt 2048 ] && IMG_MB=2048
+        echo "rootfs 实际 ${ROOTFS_MB}MB，镜像 ${IMG_MB}MB"
+
+        truncate -s "${IMG_MB}M" "$FINAL_DIR/rootfs.img"
         mkfs.ext4 -F -L rootfs "$FINAL_DIR/rootfs.img"
         mkdir -p mnt_rootfs
         sudo mount -o loop "$FINAL_DIR/rootfs.img" mnt_rootfs
         sudo cp -a usb_pure_rootfs/. mnt_rootfs/
+        sync
         sudo umount mnt_rootfs
         rmdir mnt_rootfs
+        e2fsck -p -f "$FINAL_DIR/rootfs.img" || true
+        echo "✅ rootfs.img: $(stat -c%s "$FINAL_DIR/rootfs.img") 字节"
 
+        # ---- DTB ----
         mkdir -p "$FINAL_DIR/dtb"
         cp dtb_out/*.dtb "$FINAL_DIR/dtb/"
+        DTB_FILE="dtb_out/${BOARD}.dtb"
+        test -f "$DTB_FILE" || { echo "❌ 找不到 $DTB_FILE"; exit 1; }
 
-        # [C4] 精确匹配本机 dtb；找不到直接报错，禁止回退到目录里任意第一个 dtb
-        DTB_FILE=$(ls dtb_out/*${DEVICE_MODEL}*.dtb 2>/dev/null | head -1)
-        if [ -z "${DTB_FILE:-}" ]; then
-          echo "❌ 未找到匹配 ${DEVICE_MODEL} 的 dtb（dtb_out: $(ls dtb_out/)）"
-          exit 1
-        fi
-        echo "使用 DTB: ${DTB_FILE}"
+        # ---- zImage + dtb ----
+        cat "${KERNEL_IMAGE}" "$DTB_FILE" > zImage-dtb
 
-        if [ ! -f "${KERNEL_IMAGE}" ]; then
-          echo "❌ 缺少内核镜像 ${KERNEL_IMAGE}"
-          exit 1
-        fi
-
-        # zImage + dtb 尾部拼接（主线 ARM 解压阶段扫描尾部 fdt）
-        cat "${KERNEL_IMAGE}" "${DTB_FILE}" > zImage-dtb
-
-        # 未封装的 zImage-dtb 一并放进产物，供本地 hexdump / inspect_rk_img.sh 体检
-        mkdir -p "$FINAL_DIR/unpacked"
-        cp zImage-dtb "$FINAL_DIR/unpacked/zImage-dtb"
-        cp "${KERNEL_IMAGE}" "$FINAL_DIR/unpacked/zImage"
-
-        # [C3] 用 Rockchip mkbootimg 打 Android boot image（ANDROID! header），
-        #       与编译教程一致；老 SDK loader 按 Android boot image 解析内核加载地址。
-        #       默认 kernel_addr=0x60408000，ramdisk 可省略；cmdline 由 ATAG 传入。
+        # ---- mkbootimg（路线 A：mmcblk1p1，无 blkdevparts）----
+        CMDLINE_BOOT="earlyprintk console=ttyS2,115200 root=/dev/mmcblk1p1 rootfstype=ext4 rw rootwait init=/sbin/init maxcpus=1"
         rm -rf mkbootimg-src
         git clone --depth 1 https://github.com/neo-technologies/rockchip-mkbootimg.git mkbootimg-src
         make -C mkbootimg-src
-        ./mkbootimg-src/mkbootimg --kernel zImage-dtb -o "$FINAL_DIR/boot.img"
+        ./mkbootimg-src/mkbootimg \
+          --kernel zImage-dtb \
+          --cmdline "$CMDLINE_BOOT" \
+          -o "$FINAL_DIR/boot.img"
+        echo "✅ boot.img: $(stat -c%s "$FINAL_DIR/boot.img") 字节"
 
-        rm -rf zImage-dtb mkbootimg-src
+        # ---- 体检 ----
+        if [ -f "$GITHUB_WORKSPACE/inspect_rk_img.sh" ]; then
+          chmod +x "$GITHUB_WORKSPACE/inspect_rk_img.sh"
+          "$GITHUB_WORKSPACE/inspect_rk_img.sh" "$FINAL_DIR/boot.img" \
+            | tee "$FINAL_DIR/boot-inspect.txt"
+        fi
 
-        # [C5] 修正版 parameter.txt（root=/dev/mmcblk1p2 + rootwait + blkdevparts）
-        cp $GITHUB_WORKSPACE/parameter.txt "$FINAL_DIR/parameter.txt"
+        # ---- parameter.txt ----
+        cp "$GITHUB_WORKSPACE/parameter.txt" "$FINAL_DIR/parameter.txt"
 
+        # ---- wipe-emmc.sh ----
+        cat > "$FINAL_DIR/wipe-emmc.sh" << 'EOF'
+        #!/bin/bash
+        # 刷机前擦除 eMMC 前 1MiB（MBR + 原厂 Android 分区表）
+        # 解决：mmcblk1p1 只有 2MiB 导致挂根 panic
+        # 用法：TTL 串口登录后执行，然后重启用 RKDevTool "升级固件" 刷机
+        set -e
+        DEV=/dev/mmcblk1
+        echo "⚠️  即将擦除 $DEV 前 1MiB，按 Ctrl+C 取消"
+        sleep 3
+        dd if=/dev/zero of=$DEV bs=1M count=1 conv=fsync
+        sync
+        echo "✅ eMMC 前 1MiB 已擦除，现在重启并用 RKDevTool 升级固件"
+        EOF
+        chmod +x "$FINAL_DIR/wipe-emmc.sh"
+
+        # ---- README ----
         cat > "$FINAL_DIR/README.txt" << EOF
-        设备型号: ${DEVICE_MODEL}
-        架构: ${ARCH}
-        内核版本: ${KERNEL_VERSION}
+        设备: ${DEVICE_MODEL}  板型: ${BOARD}
+        内核: ${KERNEL_VERSION}  根文件系统: Ubuntu ${UBUNTU_VERSION} ${UBUNTU_ARCH}
 
-        使用瑞芯微开发工具(RKDevTool)刷机:
-        1. 选择 Loader (你的原厂 loader)
-        2. 选择 parameter.txt
-        3. 选择 boot.img (Android boot image，Rockchip mkbootimg 打包)
-        4. 选择 rootfs.img
+        ========== 刷机步骤 ==========
+        1. 【必做】擦除 eMMC 旧分区表：
+           方式 A：TTL 串口登录现有系统，执行 wipe-emmc.sh
+           方式 B：RKDevTool → 高级功能 → 擦除 Flash → 全盘擦除
+        2. RKDevTool 用 "升级固件" 模式（不是 "下载镜像"）：
+           - loader（原厂）
+           - parameter.txt
+           - boot.img
+           - rootfs.img
+        3. 点击 "执行"，等待完成
+        4. 串口 ttyS2 / 115200 查看启动日志
 
-        备注:
-        - 串口 ttyS2 / 115200（物理 UART2，与 DTS &uart2、chosen stdout-path 一致）
-        - rootfs 挂 /dev/mmcblk1p2（blkdevparts 命令行分区），含 rootwait
-        - boot.img 为标准 Android boot image（ANDROID! header，kernel_addr=0x60408000）
-        - unpacked/ 目录为未封装的 zImage 与 zImage-dtb，供本地 hexdump 体检
+        ========== 验证成功标志 ==========
+        日志里应出现：
+          Kernel command line: ... root=/dev/mmcblk1p1 ...
+          mmcblk1p1: ... 3.5 GiB   （不是 2MiB！）
+          EXT4-fs (mmcblk1p1): mounted filesystem
+          Run /sbin/init as init process
+
+        ========== 账号 ==========
+        root 密码: ${ROOT_PASSWORD}
+        首次登录后请立即 passwd root 修改
         EOF
 
         ZIP_NAME="${FINAL_DIR}.zip"
@@ -363,11 +327,14 @@ jobs:
         cd ..
         echo "ZIP_NAME=${ZIP_NAME}" >> "$GITHUB_ENV"
 
-    - name: 9. 上传到 Releases
+    # ============================================================
+    # 步骤 8：上传 Release
+    # ============================================================
+    - name: 8. 上传到 Releases
       uses: softprops/action-gh-release@v2
       with:
         tag_name: build-${{ github.run_number }}-${{ inputs.device_model }}
-        name: "Rockchip ${{ inputs.device_model }} Ubuntu 刷机包 (Kernel ${{ inputs.kernel_version }})"
+        name: "RK3188 Ubuntu ${UBUNTU_VERSION} (Kernel ${KERNEL_VERSION}) - ${BOARD}"
         files: |
           ${{ env.ZIP_NAME }}
       env:
