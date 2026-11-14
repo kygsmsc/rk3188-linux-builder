@@ -3,16 +3,16 @@
 # lib/common.sh — RK3188 纯净 rootfs 构建核心（三发行版）
 #
 # 支持 DISTRO=ubuntu | debian | armbian，三路分发：
-#   ubuntu  : 下载官方 ubuntu-base-*.tar.gz 解压（原方式）
+#   ubuntu  : 下载官方 ubuntu-base-*.tar.gz 解压
 #   debian  : mmdebstrap 现场构建（最小系统）
-#   armbian : 下载官方 .img.xz，losetup 挂载提取 rootfs 分区
+#   armbian : 从清华镜像站下载 .img.xz，losetup 挂载提取 rootfs
 #
 # 关键环境变量（均有默认值）：
 #   MODE            ttl | usb
 #   DISTRO          ubuntu | debian | armbian（默认 ubuntu）
 #   UBUNTU_VERSION  22.04.5（DISTRO=ubuntu）
 #   UBUNTU_ARCH     armhf
-#   UBUNTU_CODENAME jammy（CI 传入）
+#   UBUNTU_CODENAME jammy（CI 传入；也可由 UBUNTU_VERSION 推导）
 #   DEBIAN_SUITE    bookworm（DISTRO=debian）
 #   DEBIAN_MIRROR   https://mirrors.aliyun.com/debian
 #   DEBIAN_ARCH     armhf
@@ -27,14 +27,16 @@
 #   ROOTFS_DIR      输出目录
 #   MINIMAL_MODE    yes/no（C 级精简）
 #
-# 相对 hi3798 版的关键修复：
+# 修复记录：
 #   [F1] BASE_TARBALL 文件名从 SHA256SUMS 探测
 #   [F2] 支持 UBUNTU_ARCH
-#   [F3] CODENAME 兼容 UBUNTU_CODENAME / DEBIAN_SUITE / ARMBIAN_RELEASE
-#   [F4] BASE_URL 优先用环境变量
+#   [F3] CODENAME 兼容三发行版
+#   [F4] BASE_URL 用 CODENAME 拼完整路径，缺 /<codename>/release 时自动修正
 #   [F5] fetch 前校验缓存 tar 完整性
-#   [F6] 三路分发（ubuntu/debian/armbian）
-#   [F7] Armbian 提取时排除 /lib/modules，避免与自编译 6.12 模块冲突
+#   [F6] 三路分发
+#   [F7] Armbian 提取时排除 /lib/modules
+#   [F8] Debian 构建前装 debian-archive-keyring（Ubuntu 宿主机默认没有）
+#   [F9] Armbian 下载改用清华镜像站 + 目录列表通配匹配真实文件名
 # ============================================================
 set -euo pipefail
 
@@ -52,7 +54,7 @@ ARMBIAN_BOARD="${ARMBIAN_BOARD:-rock-5b}"
 ARMBIAN_RELEASE="${ARMBIAN_RELEASE:-bookworm}"
 ARMBIAN_BRANCH="${ARMBIAN_BRANCH:-current}"
 
-BASE_URL="${BASE_URL:-https://cdimage.ubuntu.com/ubuntu-base/releases/${_UBUNTU_SERIES}/release}"
+# Ubuntu 镜像源（apt 用）
 MIRROR="${MIRROR:-http://repo.huaweicloud.com/ubuntu-ports}"
 
 TARGET_HOSTNAME="${TARGET_HOSTNAME:-rk3188}"
@@ -78,6 +80,15 @@ if [ -z "${UBUNTU_CODENAME:-}" ]; then
   esac
 fi
 export UBUNTU_CODENAME
+
+# [F4] BASE_URL：优先环境变量；若缺少 /<codename>/release 段则自动修正
+# 注意：Ubuntu Base 的目录名是代号（jammy），不是版本号（22.04）
+BASE_URL="${BASE_URL:-}"
+if [ "$DISTRO" = "ubuntu" ]; then
+  if [ -z "$BASE_URL" ] || ! echo "$BASE_URL" | grep -qE "/${UBUNTU_CODENAME}/release/?$"; then
+    BASE_URL="https://cdimage.ubuntu.com/ubuntu-base/releases/${UBUNTU_CODENAME}/release"
+  fi
+fi
 
 echo "==> [common.sh] DISTRO=$DISTRO  CODENAME=$UBUNTU_CODENAME  ARCH=$UBUNTU_ARCH"
 echo "==> [common.sh] TARGET_HOSTNAME=$TARGET_HOSTNAME"
@@ -112,7 +123,6 @@ cleanup_mounts() {
   for m in tmp var/cache/apt/archives dev/pts dev sys proc; do
     $SUDO umount -lf "$ROOTFS_DIR/$m" 2>/dev/null || true
   done
-  # Armbian 提取时可能残留的临时挂载
   $SUDO umount -lf "$(pwd)/mnt_armbian_tmp" 2>/dev/null || true
 }
 trap cleanup_mounts EXIT INT TERM
@@ -134,6 +144,11 @@ resolve_base_tarball() {
 }
 
 fetch_ubuntu_base() {
+  # [F4] 兜底：如果 BASE_URL 还不完整，再修正一次
+  if ! echo "$BASE_URL" | grep -qE "/${UBUNTU_CODENAME}/release/?$"; then
+    BASE_URL="https://cdimage.ubuntu.com/ubuntu-base/releases/${UBUNTU_CODENAME}/release"
+  fi
+
   log "下载 Ubuntu Base $UBUNTU_VERSION ($UBUNTU_ARCH)..."
   mkdir -p cache
   wget -q --tries=3 --timeout=30 -O cache/SHA256SUMS "$BASE_URL/SHA256SUMS" 2>/dev/null \
@@ -169,6 +184,7 @@ prepare_ubuntu_rootfs() {
 
 # ============================================================
 # 【Debian 路径】mmdebstrap 现场构建
+#   [F8] 构建前装 debian-archive-keyring（Ubuntu 宿主机默认没有 Debian 公钥）
 # ============================================================
 build_debian_rootfs() {
   log "构建 Debian $DEBIAN_SUITE ($DEBIAN_ARCH) rootfs via mmdebstrap..."
@@ -179,14 +195,20 @@ build_debian_rootfs() {
     $SUDO apt-get install -y -qq mmdebstrap qemu-user-static binfmt-support
   fi
 
+  # [F8] 关键：Ubuntu 宿主机需装 Debian GPG 公钥，否则 mmdebstrap 报 NO_PUBKEY
+  if ! dpkg -l debian-archive-keyring >/dev/null 2>&1; then
+    log "安装 debian-archive-keyring（Debian GPG 公钥）..."
+    $SUDO apt-get install -y -qq debian-archive-keyring
+  fi
+
   $SUDO rm -rf "$ROOTFS_DIR"
   mkdir -p "$ROOTFS_DIR"
 
-  # minbase 只装最小系统；--include 预装必要包，减少 chroot 内 apt 时间
   $SUDO mmdebstrap \
     --architectures="$DEBIAN_ARCH" \
     --variant=minbase \
     --components="main" \
+    --keyring=/usr/share/keyrings/debian-archive-keyring.gpg \
     --include="apt-utils,ca-certificates,locales,tzdata,systemd,systemd-sysv,dbus,udev,e2fsprogs,openssh-server,sudo,iproute2,ifupdown,isc-dhcp-client,network-manager,wpasupplicant,iw,rfkill,iptables,file,procps" \
     "$DEBIAN_SUITE" \
     "$ROOTFS_DIR" \
@@ -197,16 +219,18 @@ build_debian_rootfs() {
 }
 
 # ============================================================
-# 【Armbian 路径】下载官方镜像，提取 rootfs 分区
+# 【Armbian 路径】清华镜像站 + 目录列表通配匹配文件名
+#   [F9] 原 dl.armbian.com 的 Bookworm_current_minimal 路径对 rock-5b
+#        可能已失效；改用清华镜像站 armbian-releases/<board>/archive/
 # ============================================================
 build_armbian_rootfs() {
   log "构建 Armbian ${ARMBIAN_BOARD} ${ARMBIAN_RELEASE} (${ARMBIAN_BRANCH}) rootfs..."
 
-  for t in losetup mount xz rsync; do
+  for t in losetup mount xz rsync wget; do
     command -v "$t" >/dev/null 2>&1 || {
       log "安装缺失工具: $t"
       $SUDO apt-get update -qq
-      $SUDO apt-get install -y -qq util-linux mount xz-utils rsync
+      $SUDO apt-get install -y -qq util-linux mount xz-utils rsync wget
     }
   done
 
@@ -216,12 +240,48 @@ build_armbian_rootfs() {
   local img="cache/armbian-${tag}.img"
 
   if [ ! -f "$img_xz" ]; then
-    local release_cap
-    release_cap=$(echo "${ARMBIAN_RELEASE}" | sed 's/^./\U&/')
-    local url="https://dl.armbian.com/${ARMBIAN_BOARD}/${release_cap}_${ARMBIAN_BRANCH}_minimal"
+    # [F9] 清华镜像站 + 目录列表通配匹配
+    local board_cap
+    board_cap=$(echo "${ARMBIAN_BOARD}" | sed 's/./\U&/')
+    # 候选镜像站（按顺序尝试）
+    local mirrors=(
+      "https://mirrors.tuna.tsinghua.edu.cn/armbian-releases/${ARMBIAN_BOARD}/archive"
+      "https://mirrors.bfsu.edu.cn/armbian-releases/${ARMBIAN_BOARD}/archive"
+      "https://mirrors.ustc.edu.cn/armbian-releases/${ARMBIAN_BOARD}/archive"
+    )
+
+    local filename=""
+    local url=""
+    local base=""
+    for base in "${mirrors[@]}"; do
+      log "从镜像站查找: ${base}/"
+      # 匹配 Armbian_*_<Board>_<release>_*_minimal.img.xz
+      filename=$(wget -q -O - "$base/" 2>/dev/null \
+        | grep -oE "Armbian_[^\"'<>[:space:]]*_${board_cap}_${ARMBIAN_RELEASE}[^\"'<>[:space:]]*_minimal\.img\.xz" \
+        | sort -V | tail -1 || true)
+      if [ -n "$filename" ]; then
+        url="${base}/${filename}"
+        log "找到: $filename"
+        break
+      fi
+    done
+
+    if [ -z "$url" ]; then
+      echo "❌ 在所有镜像站都找不到匹配的 Armbian 镜像"
+      echo "   板型: ${ARMBIAN_BOARD}  release: ${ARMBIAN_RELEASE}  branch: ${ARMBIAN_BRANCH}"
+      echo "   尝试过:"
+      for b in "${mirrors[@]}"; do echo "     - ${b}/"; done
+      echo "   排查建议："
+      echo "     1) 访问 https://mirrors.tuna.tsinghua.edu.cn/armbian-releases/${ARMBIAN_BOARD}/archive/"
+      echo "        确认实际存在的 release/branch 组合"
+      echo "     2) 调整 workflow input: armbian_release / armbian_branch"
+      echo "     3) 或改 armbian_board 为 Armbian 官方支持的板型"
+      exit 1
+    fi
+
     log "下载 Armbian 镜像: $url"
     wget -q -c --tries=5 --timeout=600 "$url" -O "$img_xz" || {
-      echo "❌ Armbian 镜像下载失败"; exit 1
+      echo "❌ Armbian 镜像下载失败: $url"; exit 1
     }
   fi
 
@@ -255,8 +315,7 @@ build_armbian_rootfs() {
   }
 
   log "复制 rootfs 内容（排除伪文件系统 + /lib/modules）..."
-  # [F7] 排除 /lib/modules：Armbian 自带模块与 6.12 内核不匹配，
-  #      后续 CI 会 modules_install 覆盖
+  # [F7] 排除 /lib/modules：Armbian 自带模块与 6.12 内核不匹配
   $SUDO rsync -aHAX \
     --exclude=/proc/* --exclude=/sys/* --exclude=/dev/* \
     --exclude=/run/* --exclude=/tmp/* \
