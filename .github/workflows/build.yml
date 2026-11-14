@@ -82,32 +82,54 @@ jobs:
 
     # ============================================================
     # 步骤 2：解析架构、CODENAME、UBUNTU_ARCH
+    # 修复：先本地赋值，再写 GITHUB_ENV（避免 set -u 下 unbound variable）
     # ============================================================
     - name: 2. 解析架构与工具链
       run: |
         set -euo pipefail
+
+        # ---- 先本地赋值（同一 step 内后续行可用）----
+        ARCH=""
+        CROSS_COMPILE=""
+        KERNEL_IMAGE=""
+        UBUNTU_ARCH=""
+        QEMU_STATIC=""
+
         case "${DEVICE_MODEL}" in
           rk3188|rk3288)
-            echo "ARCH=arm" >> "$GITHUB_ENV"
-            echo "CROSS_COMPILE=arm-linux-gnueabihf-" >> "$GITHUB_ENV"
-            echo "KERNEL_IMAGE=zImage" >> "$GITHUB_ENV"
-            echo "UBUNTU_ARCH=armhf" >> "$GITHUB_ENV"
-            echo "QEMU_STATIC=qemu-arm-static" >> "$GITHUB_ENV"
+            ARCH="arm"
+            CROSS_COMPILE="arm-linux-gnueabihf-"
+            KERNEL_IMAGE="zImage"
+            UBUNTU_ARCH="armhf"
+            QEMU_STATIC="qemu-arm-static"
             ;;
           *)
-            echo "ARCH=arm64" >> "$GITHUB_ENV"
-            echo "CROSS_COMPILE=aarch64-linux-gnu-" >> "$GITHUB_ENV"
-            echo "KERNEL_IMAGE=Image" >> "$GITHUB_ENV"
-            echo "UBUNTU_ARCH=arm64" >> "$GITHUB_ENV"
-            echo "QEMU_STATIC=qemu-aarch64-static" >> "$GITHUB_ENV"
+            ARCH="arm64"
+            CROSS_COMPILE="aarch64-linux-gnu-"
+            KERNEL_IMAGE="Image"
+            UBUNTU_ARCH="arm64"
+            QEMU_STATIC="qemu-aarch64-static"
             ;;
         esac
+
+        CODENAME=""
         case "${UBUNTU_VERSION}" in
-          20.04.*) echo "CODENAME=focal" >> "$GITHUB_ENV" ;;
-          22.04.*) echo "CODENAME=jammy" >> "$GITHUB_ENV" ;;
-          24.04.*) echo "CODENAME=noble" >> "$GITHUB_ENV" ;;
+          20.04.*) CODENAME="focal" ;;
+          22.04.*) CODENAME="jammy" ;;
+          24.04.*) CODENAME="noble" ;;
           *) echo "❌ 未知 UBUNTU_VERSION: ${UBUNTU_VERSION}"; exit 1 ;;
         esac
+
+        # ---- 写 GITHUB_ENV（下一步生效）----
+        {
+          echo "ARCH=${ARCH}"
+          echo "CROSS_COMPILE=${CROSS_COMPILE}"
+          echo "KERNEL_IMAGE=${KERNEL_IMAGE}"
+          echo "UBUNTU_ARCH=${UBUNTU_ARCH}"
+          echo "QEMU_STATIC=${QEMU_STATIC}"
+          echo "CODENAME=${CODENAME}"
+        } >> "$GITHUB_ENV"
+
         echo "✅ ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} UBUNTU_ARCH=${UBUNTU_ARCH} CODENAME=${CODENAME}"
 
     # ============================================================
@@ -115,6 +137,7 @@ jobs:
     # ============================================================
     - name: 3. 安装编译与打包依赖
       run: |
+        set -euo pipefail
         sudo apt-get update -qq
         sudo apt-get install -y -qq \
           build-essential flex bison libssl-dev libelf-dev bc rsync \
