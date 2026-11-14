@@ -9,28 +9,14 @@
 #   [F3] CODENAME 同时接受 UBUNTU_VERSION 与 CI 传入的 CODENAME
 #   [F4] BASE_URL 优先用环境变量（CI 已拼好 series），fallback 才按版本拼
 #   [F5] fetch 前校验缓存 tar 完整性
-#
-# 可配置环境变量（均有默认值）：
-#   MODE            ttl | usb
-#   UBUNTU_VERSION  22.04.5（默认）
-#   UBUNTU_ARCH     armhf（默认，rk3188）/ arm64
-#   BASE_URL        Ubuntu Base 下载目录
-#   MIRROR          apt 软件源镜像（默认华为云）
-#   TARGET_HOSTNAME 主机名（默认 rk3188）
-#   ROOT_PASSWORD   root 密码（默认 root123）
-#   TIMEZONE        时区（默认 Asia/Shanghai）
-#   LOCALES         locale 列表
-#   ROOTFS_DIR      输出目录
-#   MINIMAL_MODE    yes/no（C 级精简）
 # ============================================================
 set -euo pipefail
 
 MODE="${MODE:?请通过 build_rootfs.sh (ttl) 或 build_usb_rootfs.sh (usb) 调用}"
 UBUNTU_VERSION="${UBUNTU_VERSION:-22.04.5}"
-UBUNTU_ARCH="${UBUNTU_ARCH:-armhf}"                         # [F2]
+UBUNTU_ARCH="${UBUNTU_ARCH:-armhf}"
 _UBUNTU_SERIES=$(echo "$UBUNTU_VERSION" | cut -d. -f1,2)
 
-# [F4] BASE_URL 优先用外部传入（CI 已拼好 series 目录）
 BASE_URL="${BASE_URL:-https://cdimage.ubuntu.com/ubuntu-base/releases/${_UBUNTU_SERIES}/release}"
 MIRROR="${MIRROR:-http://repo.huaweicloud.com/ubuntu-ports}"
 
@@ -41,7 +27,6 @@ ROOT_PASSWORD="${ROOT_PASSWORD:-root123}"
 TIMEZONE="${TIMEZONE:-Asia/Shanghai}"
 LOCALES="${LOCALES:-en_US.UTF-8 zh_CN.UTF-8}"
 
-# [F3] CODENAME：优先环境变量，其次由版本推导
 if [ -z "${UBUNTU_CODENAME:-}" ]; then
   case "$_UBUNTU_SERIES" in
     20.04) UBUNTU_CODENAME="focal" ;;
@@ -54,7 +39,7 @@ export UBUNTU_CODENAME
 
 echo "==> [common.sh] UBUNTU_VERSION=$UBUNTU_VERSION  UBUNTU_ARCH=$UBUNTU_ARCH  CODENAME=$UBUNTU_CODENAME"
 echo "==> [common.sh] TARGET_HOSTNAME=$TARGET_HOSTNAME"
-echo "==> [common.sh] CUSTOM_MAC=${CUSTOM_MAC:-(未设置，用设备原生 MAC)}"
+echo "==> [common.sh] CUSTOM_MAC=${CUSTOM_MAC:-(未设置)}"
 echo "==> [common.sh] MINIMAL_MODE=$MINIMAL_MODE"
 echo "==> [common.sh] BASE_URL=$BASE_URL"
 echo "==> [common.sh] MIRROR=$MIRROR"
@@ -65,7 +50,7 @@ case "$MODE" in
   *)   echo "❌ 未知 MODE: $MODE" >&2; exit 1 ;;
 esac
 ROOTFS_DIR="${ROOTFS_DIR:-$DEFAULT_ROOTFS_DIR}"
-BASE_TARBALL=""   # 由 resolve_base_tarball 填充
+BASE_TARBALL=""
 LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if [ "$(id -u)" -eq 0 ]; then
@@ -87,7 +72,6 @@ cleanup_mounts() {
 }
 trap cleanup_mounts EXIT INT TERM
 
-# [F1] 从 SHA256SUMS 探测真实文件名
 resolve_base_tarball() {
   local sums="cache/SHA256SUMS"
   local probe=""
@@ -104,7 +88,6 @@ resolve_base_tarball() {
 fetch_base() {
   log "下载 Ubuntu Base $UBUNTU_VERSION ($UBUNTU_ARCH)..."
   mkdir -p cache
-  # 先拉 SHA256SUMS（轻量，用于探测真实文件名）
   wget -q --tries=3 --timeout=30 -O cache/SHA256SUMS "$BASE_URL/SHA256SUMS" 2>/dev/null \
     || echo "⚠️  未获取 SHA256SUMS，将按版本号猜文件名"
   resolve_base_tarball
@@ -113,7 +96,6 @@ fetch_base() {
 
   (
     cd cache
-    # [F5] 缓存完整性校验
     if [ -f "$BASE_TARBALL" ] && ! tar -tzf "$BASE_TARBALL" >/dev/null 2>&1; then
       echo "⚠️  缓存损坏，重新下载"
       rm -f "$BASE_TARBALL"
