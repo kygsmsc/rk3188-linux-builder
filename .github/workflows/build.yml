@@ -50,11 +50,11 @@ on:
         options: ['current', 'edge', 'vendor', 'legacy']
         default: 'legacy'
       base_url:
-        description: 'Ubuntu Base 下载根前缀（可留空，common.sh 会自动拼完整）'
+        description: 'Ubuntu Base 下载根前缀（留空则自动用 codename 拼完整）'
         required: false
         default: ''
       mirror:
-        description: 'apt 软件源镜像'
+        description: 'apt 软件源镜像（Ubuntu）'
         required: false
         default: 'http://repo.huaweicloud.com/ubuntu-ports'
       debian_mirror:
@@ -86,6 +86,7 @@ permissions:
 jobs:
   # ============================================================
   # 准备矩阵：把 inputs.distros 拆成矩阵
+  # 关键：Ubuntu 的 codename 必须是代号（jammy/focal/noble），不能是版本号
   # ============================================================
   prepare-matrix:
     runs-on: ubuntu-22.04
@@ -95,6 +96,16 @@ jobs:
       - id: set-matrix
         run: |
           set -euo pipefail
+
+          # Ubuntu 版本 → 代号
+          UV="${{ inputs.ubuntu_version }}"
+          case "$UV" in
+            20.04.*) UCODENAME="focal" ;;
+            22.04.*) UCODENAME="jammy" ;;
+            24.04.*) UCODENAME="noble" ;;
+            *)       UCODENAME="jammy" ;;
+          esac
+
           DISTROS="${{ inputs.distros }}"
           MATRIX="[]"
           IFS=',' read -ra ARR <<< "$DISTROS"
@@ -102,24 +113,26 @@ jobs:
             d=$(echo "$d" | xargs)
             case "$d" in
               ubuntu)
-                MATRIX=$(echo "$MATRIX" | jq -c --arg ubuntu_ver "${{ inputs.ubuntu_version }}" '. + [{
-                  "distro":"ubuntu",
-                  "codename":$ubuntu_ver,
-                  "debian_suite":"bookworm",
-                  "armbian_board":"rock-5b",
-                  "armbian_release":"bookworm",
-                  "armbian_branch":"legacy"
-                }]')
+                MATRIX=$(echo "$MATRIX" | jq -c --arg c "$UCODENAME" \
+                  '. + [{
+                    "distro":"ubuntu",
+                    "codename":$c,
+                    "debian_suite":"bookworm",
+                    "armbian_board":"rock-5b",
+                    "armbian_release":"bookworm",
+                    "armbian_branch":"legacy"
+                  }]')
                 ;;
               debian)
-                MATRIX=$(echo "$MATRIX" | jq -c --arg suite "${{ inputs.debian_suite }}" '. + [{
-                  "distro":"debian",
-                  "codename":$suite,
-                  "debian_suite":$suite,
-                  "armbian_board":"rock-5b",
-                  "armbian_release":"bookworm",
-                  "armbian_branch":"legacy"
-                }]')
+                MATRIX=$(echo "$MATRIX" | jq -c --arg c "${{ inputs.debian_suite }}" \
+                  '. + [{
+                    "distro":"debian",
+                    "codename":$c,
+                    "debian_suite":$c,
+                    "armbian_board":"rock-5b",
+                    "armbian_release":"bookworm",
+                    "armbian_branch":"legacy"
+                  }]')
                 ;;
               armbian)
                 MATRIX=$(echo "$MATRIX" | jq -c \
@@ -176,7 +189,7 @@ jobs:
       uses: actions/checkout@v4
 
     # ============================================================
-    # 步骤 2：解析架构与 UBUNTU_ARCH
+    # 步骤 2：解析架构与 UBUNTU_ARCH（本地赋值 + GITHUB_ENV 双保险）
     # ============================================================
     - name: 2. 解析架构与工具链
       run: |
@@ -216,7 +229,10 @@ jobs:
         echo "✅ DISTRO=${DISTRO} ARCH=${ARCH} UBUNTU_ARCH=${UBUNTU_ARCH} CODENAME=${CODENAME}"
 
     # ============================================================
-    # 步骤 3：安装依赖（含 debian-archive-keyring，修 Debian NO_PUBKEY）
+    # 步骤 3：安装依赖
+    #   - debian-archive-keyring：修 Debian NO_PUBKEY
+    #   - mmdebstrap / binfmt-support：Debian 构建
+    #   - jq：矩阵生成
     # ============================================================
     - name: 3. 安装编译与打包依赖
       run: |
@@ -243,7 +259,8 @@ jobs:
 
     # ============================================================
     # 步骤 5：构建纯净 rootfs
-    # 注意：BASE_URL 不再在 CI 里拼；由 common.sh 根据 CODENAME 自动修正
+    #   - BASE_URL 留空时由 common.sh 用 CODENAME 拼完整路径
+    #   - UBUNTU_CODENAME 必须是代号（jammy/focal/noble）
     # ============================================================
     - name: 5. 构建纯净 rootfs
       run: |
@@ -265,10 +282,12 @@ jobs:
         export MINIMAL_MODE="${MINIMAL_MODE}"
         export ROOT_PASSWORD="${ROOT_PASSWORD}"
         export CUSTOM_MAC="${CUSTOM_MAC}"
-        # BASE_URL：留空则 common.sh 用 CODENAME 拼完整路径
+
+        # BASE_URL 仅在用户显式传入时才导出；否则 common.sh 自动拼
         if [ -n "${BASE_URL:-}" ]; then
           export BASE_URL
         fi
+
         chmod +x build_rootfs.sh lib/*.sh
         sudo -E ./build_rootfs.sh
 
@@ -376,6 +395,7 @@ jobs:
 
         cat > "$FINAL_DIR/wipe-emmc.sh" << 'EOF'
         #!/bin/bash
+        # 刷机前擦除 eMMC 前 1MiB（MBR + 原厂 Android 分区表）
         set -e
         DEV=/dev/mmcblk1
         echo "⚠️  即将擦除 $DEV 前 1MiB，按 Ctrl+C 取消"
