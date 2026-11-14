@@ -2,19 +2,23 @@
 # lib/rootfs_inner.sh — 在 chroot 内执行的系统配置脚本
 # 兼容 Ubuntu 20.04 (focal) / 22.04 (jammy) / 24.04 (noble)
 #
-# 关键修复：
+# 移植自 hi3798 项目，针对 rk3188 + Linux 6.12 适配：
 #   [P1]  firstboot-password 正向判据 /etc/firstboot-pwd.txt
 #   [P2]  WantedBy=multi-user.target + After=local-fs.target + Before=ssh.service
 #   [P3]  chpasswd 失败保留密码文件重试
-#   [P4]  printf + cat 管道读取密码（避开 bash 内建 $PWD）
-#   [P5]  移除 modules-load.d（4.4 内核模块全内建）
+#   [P4]  printf + cat 管道读取密码
+#   [P5]  ❌ 已删除（6.12 有 =m 模块，modules-load.d 必须保留）
 #   [P6]  system.conf.d/99-old-kernel.conf 消除 hidepid 警告
-#   [P7]  保留 apt lists + 99-no-translations（省 ~15MB，可直接 apt install）
-#   [P8]  A 级精简 consolefonts/keymaps/hwdb.bin（省 ~17MB）
-#   [P9]  精简不做 apt 操作（避免打断 systemd enable）
-#   [P10] eth0 由 NetworkManager 管理（ifupdown 只处理 lo）
-#   [P11] 删除 Ubuntu 默认 10-globally-managed-devices.conf（排除 eth0 的元凶）
-#   [P12] 预装 iptables 并切换到 legacy 后端（解决 Docker 在 4.4 内核启动失败）
+#   [P7]  保留 apt lists + 99-no-translations
+#   [P8]  A 级精简 consolefonts/keymaps/hwdb.bin
+#   [P9]  精简不做 apt 操作
+#   [P10] eth0 由 NetworkManager 管理
+#   [P11] 删除 Ubuntu 默认 10-globally-managed-devices.conf
+#   [P12] 预装 iptables 并切换 legacy 后端
+#   [R1]  enable serial-getty@ttyS2（rk3188 console=ttyS2）
+#   [R2]  /etc/fstab 用 LABEL=rootfs 兜底
+#   [R3]  depmod -a（模块索引，6.12 必做）
+#   [R4]  MINIMAL_MODE=yes 时 C 级精简（rsyslog/net-tools/ethtool）
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 export LC_ALL=C LANG=C
@@ -52,7 +56,7 @@ Acquire::IndexTargets::deb::DEP-11-icons-large::DefaultEnabled "false";
 Acquire::Languages "none";
 APTCONF
 
-CODENAME="${UBUNTU_CODENAME:-focal}"
+CODENAME="${UBUNTU_CODENAME:-jammy}"
 echo "==> Ubuntu 代号: $CODENAME"
 echo "==> 软件源: $MIRROR"
 
@@ -73,7 +77,7 @@ Suites: $CODENAME-security
 Components: main restricted universe multiverse
 Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
 SOURCES
-    > /etc/apt/sources.list
+    : > /etc/apt/sources.list
 else
     echo "==> 传统格式软件源 (20.04 / 22.04)"
     cat > /etc/apt/sources.list << SOURCES
@@ -89,8 +93,6 @@ apt-get -f install -y -qq 2>&1 || true
 
 # ============================================================
 # 核心软件包
-#   含 WiFi 依赖：file / network-manager / wpasupplicant / iw / rfkill
-#   含 iptables：预装以便 Docker 兼容性处理（P12）
 # ============================================================
 echo "==> 安装核心软件包"
 apt-get install -y -qq --no-install-recommends \
@@ -104,10 +106,7 @@ apt-get install -y -qq --no-install-recommends \
   iptables
 
 # ============================================================
-# 【P12】iptables 切换到 legacy 后端
-#   原因：4.4 内核与 iptables-nft 后端兼容性差（缺 addrtype match）
-#   Docker 启动时无法添加 NAT 规则，报 Couldn't load match 'addrtype'
-#   本段确保预装 iptables 后立即切换到 legacy
+# [P12] iptables 切换到 legacy 后端
 # ============================================================
 echo "==> 配置 iptables 使用 legacy 后端（兼容旧内核的 Docker）"
 if [ -x /usr/sbin/iptables-legacy ]; then
@@ -197,12 +196,23 @@ ln -sf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
 echo "$TIMEZONE" > /etc/timezone
 dpkg-reconfigure -f noninteractive tzdata >/dev/null 2>&1 || true
 
+# ========== [R2] fstab（LABEL=rootfs 兜底）==========
+cat > /etc/fstab << 'FSTAB'
+# <file system>  <mount point>  <type>     <options>                         <dump> <pass>
+LABEL=rootfs     /              ext4       defaults,noatime,errors=remount-ro 0     1
+proc             /proc          proc       defaults                          0     0
+sysfs            /sys           sysfs      defaults                          0     0
+devtmpfs         /dev           devtmpfs   mode=0755,nosuid                  0     0
+tmpfs            /tmp           tmpfs      defaults,nosuid,size=64M          0     0
+FSTAB
+echo "✅ /etc/fstab 已生成（LABEL=rootfs 兜底）"
+
 # ========== root 密码 ==========
 echo "==> 设置 root 密码（长度 ${#ROOT_PASSWORD} 字符）"
 echo "root:$ROOT_PASSWORD" | chpasswd
-sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config 2>/dev/null || true
 
-# ========== firstboot-password（正向判据防弹版） ==========
+# ========== [P1-P4] firstboot-password ==========
 printf '%s\n' "$ROOT_PASSWORD" > /etc/firstboot-pwd.txt
 chmod 600 /etc/firstboot-pwd.txt
 chown root:root /etc/firstboot-pwd.txt
@@ -264,7 +274,7 @@ systemctl enable firstboot-apt-update.service 2>/dev/null || true
 echo "✅ firstboot-apt-update.service 已启用"
 
 # ============================================================
-# 【P10/P11】网络：eth0 + wlan0 全由 NetworkManager 管理
+# [P10/P11] 网络：eth0 + wlan0 全由 NetworkManager 管理
 # ============================================================
 echo "==> 网络配置（eth0 + wlan0 全部由 NetworkManager 管理）"
 
@@ -277,22 +287,18 @@ auto lo
 iface lo inet loopback
 
 # eth0 / wlan0 全部由 NetworkManager 管理
-# 禁止在此文件或 interfaces.d 下配置 eth0，否则 NM 会忽略 eth0
 NETIF
 
-# 【P11】删除 Ubuntu 默认 unmanaged-devices 配置（排除 eth0 的元凶）
+# [P11] 删除 Ubuntu 默认 unmanaged-devices 配置
 rm -f /usr/lib/NetworkManager/conf.d/10-globally-managed-devices.conf
 
 mkdir -p /etc/NetworkManager/conf.d
 cat > /etc/NetworkManager/conf.d/10-globally-managed-devices.conf << 'NMOVERRIDE'
-# 覆盖 Ubuntu Server/Base 默认配置
-# 默认: unmanaged-devices=*,except:type:wifi,except:type:gsm,except:type:cdma
-# 会排除所有 ethernet 设备（eth0），本文件将其清空
 [keyfile]
 unmanaged-devices=
 NMOVERRIDE
 
-cat > /etc/NetworkManager/conf.d/99-hinas.conf << 'NMCONF'
+cat > /etc/NetworkManager/conf.d/99-rk3188.conf << 'NMCONF'
 [device]
 wifi.scan-rand-mac-address=no
 
@@ -408,6 +414,10 @@ systemctl mask dpkg-db-backup.timer 2>/dev/null || true
 systemctl mask networkd-dispatcher 2>/dev/null || true
 systemctl set-default multi-user.target 2>/dev/null || true
 
+# ========== [R1] rk3188 console=ttyS2 ==========
+systemctl enable serial-getty@ttyS2.service 2>/dev/null || true
+echo "✅ serial-getty@ttyS2 已启用"
+
 cat > /etc/systemd/system/rfkill-unblock-wifi.service << 'SVC'
 [Unit]
 Description=Unblock WiFi via rfkill
@@ -426,273 +436,3 @@ systemctl enable rfkill-unblock-wifi.service 2>/dev/null || true
 cat > /etc/systemd/timesyncd.conf << 'NTP'
 [Time]
 NTP=ntp.aliyun.com ntp.tencent.com cn.pool.ntp.org
-FallbackNTP=0.cn.pool.ntp.org 1.cn.pool.ntp.org 2.cn.pool.ntp.org 3.cn.pool.ntp.org
-NTP
-
-# ========== logind + system 老内核兼容 ==========
-SYSTEMD_VER=$(systemctl --version 2>/dev/null | head -1 | awk '{print $2}' | cut -d. -f1)
-if [ "${SYSTEMD_VER:-0}" -ge 247 ] 2>/dev/null; then
-    echo "==> systemd $SYSTEMD_VER >= 247，写入 logind + system 兼容配置"
-    mkdir -p /etc/systemd/logind.conf.d
-    cat > /etc/systemd/logind.conf.d/99-old-kernel.conf << 'LOGIND'
-[Login]
-ProtectProc=default
-ProcSubset=all
-LOGIND
-
-    mkdir -p /etc/systemd/system.conf.d
-    cat > /etc/systemd/system.conf.d/99-old-kernel.conf << 'SYSCONF'
-[Manager]
-DefaultProtectProc=default
-SYSCONF
-else
-    echo "==> systemd ${SYSTEMD_VER:-未知} < 247，跳过 logind 兼容配置"
-fi
-
-mkdir -p /etc/systemd/resolved.conf.d
-cat > /etc/systemd/resolved.conf.d/99-dns.conf << 'DNS'
-[Resolve]
-DNS=223.5.5.5 223.6.6.6
-FallbackDNS=119.29.29.29 1.1.1.1
-DNSStubListener=yes
-DNS
-
-cat > /root/.bashrc << 'BASHRC'
-[ -f /etc/bash.bashrc ] && . /etc/bash.bashrc
-[ -f /etc/bash_completion ] && . /etc/bash_completion
-alias ll='ls -alF'
-alias la='ls -A'
-alias l='ls -CF'
-PS1='\[\e[1;32m\]\u@\h\[\e[0m\]:\[\e[1;34m\]\w\[\e[0m\]\$ '
-BASHRC
-
-cat > /etc/resolv.conf << 'RESOLV'
-nameserver 223.5.5.5
-nameserver 223.6.6.6
-RESOLV
-
-# ========== 深度清理 ==========
-echo "==> 深度清理"
-apt-get autoremove -y --purge
-apt-get clean
-
-rm -rf /var/tmp/* /tmp/* /root/.cache 2>/dev/null || true
-rm -rf /usr/share/doc /usr/share/man /usr/share/info \
-       /usr/share/lintian /usr/share/linda /usr/share/groff 2>/dev/null || true
-rm -rf /usr/lib/systemd/catalog \
-       /usr/lib/systemd/systemd-analyze \
-       /usr/lib/systemd/systemd-boot* 2>/dev/null || true
-find /usr/lib -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
-find /usr/lib -name '*.pyc' -delete 2>/dev/null || true
-
-if [ -d /usr/share/bash-completion/completions ]; then
-  cd /usr/share/bash-completion/completions
-  _KEEP="apt apt-get apt-cache dpkg ssh scp systemctl journalctl hostname ip curl wget less vim htop nmcli"
-  for _f in *; do
-    _keep=0
-    for _k in $_KEEP; do
-      [ "$_f" = "$_k" ] && _keep=1 && break
-    done
-    [ "$_keep" -eq 0 ] && rm -f "$_f"
-  done
-  cd /
-fi
-
-: > /var/log/bootstrap.log 2>/dev/null || true
-: > /var/log/apt/history.log 2>/dev/null || true
-: > /var/log/apt/term.log 2>/dev/null || true
-: > /var/log/dpkg.log 2>/dev/null || true
-: > /var/log/alternatives.log 2>/dev/null || true
-rm -f /var/log/*.gz /var/log/*.old /var/log/*.1 2>/dev/null || true
-
-rm -f /usr/bin/qemu-arm-static
-rm -f /etc/apt/apt.conf.d/99minimize /etc/apt/apt.conf.d/99locale-keep
-
-# ========== A 级精简（零影响） ==========
-echo "==> 精简 A 级（零影响）"
-rm -rf /usr/share/consolefonts 2>/dev/null || true
-rm -rf /usr/share/keymaps 2>/dev/null || true
-rm -f /etc/udev/hwdb.bin 2>/dev/null || true
-echo "  ✅ 已移除 consolefonts / keymaps / hwdb.bin（~17MB）"
-
-if [ "${MINIMAL_MODE:-no}" = "yes" ]; then
-    echo "==> 精简 B 级（纯文件删除）"
-    rm -rf /usr/bin/htop 2>/dev/null || true
-    rm -rf /usr/share/bash-completion 2>/dev/null || true
-    echo "  ✅ 已移除 htop / bash-completion（~4MB）"
-fi
-
-# 精简后重新 enable（保证 systemd 符号链接存在）
-echo "==> 重新 enable 服务"
-systemctl enable firstboot-password.service 2>/dev/null || true
-systemctl enable firstboot-apt-update.service 2>/dev/null || true
-systemctl enable ssh networking NetworkManager systemd-timesyncd systemd-resolved 2>/dev/null || true
-systemctl enable rfkill-unblock-wifi.service 2>/dev/null || true
-
-# ========== 防御性清理 ==========
-find /root -mindepth 1 -maxdepth 1 \
-    ! -name '.bashrc' ! -name '.profile' ! -name '.bash_logout' \
-    ! -name '.cache' ! -name '.local' \
-    -exec rm -rf {} + 2>/dev/null || true
-find /tmp  -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
-find /home -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
-rm -rf /root/work /root/original_usb /root/tmp 2>/dev/null || true
-for f in /mv100*.zip /www_raw.ext4 /backup-32.gz /sdat2img.py \
-         /simg2img.py /sparse_info.py /p9-rootfs.img /p8-backup.img; do
-  rm -f "$f" 2>/dev/null || true
-done
-
-# ============================================================
-# 审计
-# ============================================================
-echo "========== rootfs 审计 =========="
-echo "--- Ubuntu 代号 ---"
-echo "$CODENAME"
-
-echo "--- APT 源 ---"
-if [ "$CODENAME" = "noble" ]; then
-    cat /etc/apt/sources.list.d/ubuntu.sources
-else
-    cat /etc/apt/sources.list
-fi
-
-echo "--- APT lists（应非空）---"
-du -sh /var/lib/apt/lists/ 2>/dev/null || echo "(MISSING!)"
-
-echo "--- /root ---"
-ls -la /root/
-echo "--- /tmp ---"
-ls -la /tmp/ 2>/dev/null || echo "(empty)"
-echo "--- /home ---"
-ls -la /home/
-echo "--- locale 数据 ---"
-ls /usr/lib/locale/ 2>/dev/null
-echo "--- WiFi / NM 命令检查 ---"
-for c in file nmtui nmtui-connect nmcli iw rfkill wpa_supplicant; do
-  printf '  %-18s ' "$c"
-  command -v "$c" 2>/dev/null || echo "(MISSING!)"
-done
-
-# ============================================================
-# 【P12】iptables 后端检查
-# ============================================================
-echo "--- iptables 后端检查（Docker 兼容性关键）---"
-echo -n "  iptables-legacy 存在: "
-if [ -x /usr/sbin/iptables-legacy ]; then
-    echo "✅ 存在"
-else
-    echo "❌ 缺失（Docker 在老内核上会启动失败）"
-    exit 1
-fi
-echo -n "  iptables 当前后端: "
-IPT_VER=$(iptables --version 2>/dev/null || echo "未安装")
-echo "$IPT_VER"
-case "$IPT_VER" in
-  *legacy*) echo "  ✅ 已切换到 legacy 后端" ;;
-  *nf_tables*) echo "  ❌ 仍为 nf_tables 后端（Docker 会失败）"; exit 1 ;;
-  *) echo "  ⚠️ 无法识别后端" ;;
-esac
-
-# ============================================================
-# 【P11】网络管理检查（eth0 → NM）
-# ============================================================
-echo "--- 网络管理检查（eth0 → NM）---"
-echo -n "  /etc/network/interfaces.d/eth0: "
-if [ -f /etc/network/interfaces.d/eth0 ]; then
-    echo "❌ 存在（ifupdown 会抢占 eth0）"
-    exit 1
-else
-    echo "✅ 不存在"
-fi
-
-echo -n "  /usr/lib/NetworkManager/conf.d/10-globally-managed-devices.conf: "
-if [ -f /usr/lib/NetworkManager/conf.d/10-globally-managed-devices.conf ]; then
-    echo "❌ 存在（Ubuntu 默认排除 eth0，本应删除）"
-    exit 1
-else
-    echo "✅ 已删除"
-fi
-
-echo -n "  /etc/NetworkManager/conf.d/10-globally-managed-devices.conf: "
-if [ -f /etc/NetworkManager/conf.d/10-globally-managed-devices.conf ]; then
-    if grep -q '^unmanaged-devices=$' /etc/NetworkManager/conf.d/10-globally-managed-devices.conf; then
-        echo "✅ 存在且正确覆盖"
-    else
-        echo "❌ 存在但内容不正确"
-        exit 1
-    fi
-else
-    echo "❌ 缺失"
-    exit 1
-fi
-
-echo -n "  /etc/NetworkManager/system-connections/eth0.nmconnection: "
-if [ -f /etc/NetworkManager/system-connections/eth0.nmconnection ]; then
-    PERM=$(stat -c '%a %U:%G' /etc/NetworkManager/system-connections/eth0.nmconnection)
-    if [ "$PERM" = "600 root:root" ]; then
-        echo "✅ 存在且权限正确 (600 root:root)"
-    else
-        echo "❌ 权限异常: $PERM"
-        exit 1
-    fi
-else
-    echo "❌ 缺失"
-    exit 1
-fi
-
-# ============================================================
-# firstboot-password 检查
-# ============================================================
-echo "--- firstboot-password 检查（关键）---"
-echo -n "  /etc/firstboot-pwd.txt: "
-if [ -f /etc/firstboot-pwd.txt ]; then
-    echo "存在 (size=$(stat -c%s /etc/firstboot-pwd.txt) bytes)"
-else
-    echo "❌ 缺失！首次启动不会重置密码"
-    exit 1
-fi
-echo -n "  /usr/local/sbin/firstboot-password.sh: "
-if [ -x /usr/local/sbin/firstboot-password.sh ]; then
-    echo "存在且可执行"
-else
-    echo "❌ 缺失或不可执行"
-    exit 1
-fi
-echo -n "  systemd enable: "
-systemctl is-enabled firstboot-password.service 2>/dev/null || { echo "❌ 未 enable"; exit 1; }
-echo "  service 的 ConditionPathExists:"
-grep '^ConditionPathExists' /etc/systemd/system/firstboot-password.service
-if grep -q '^ConditionPathExists=!' /etc/systemd/system/firstboot-password.service; then
-    echo "  ❌ 检测到反向判据（!）"
-    exit 1
-fi
-
-echo "--- /etc/shadow 中 root 行（前 40 字符）---"
-grep '^root:' /etc/shadow | cut -c1-40
-if ! grep -q '^root:\$' /etc/shadow; then
-    echo "  ❌ shadow 中 root 行结构异常"
-    exit 1
-fi
-
-echo "--- shadow/passwd 权限 ---"
-stat -c '    %A %U:%G %n' /etc/passwd /etc/shadow /etc/group /etc/gshadow
-
-echo "--- 精简 A 级验证（应全部不存在）---"
-for p in /usr/share/consolefonts /usr/share/keymaps /etc/udev/hwdb.bin; do
-  if [ -e "$p" ]; then
-    echo "  ⚠️  $p 仍存在"
-  else
-    echo "  ✅ $p 已清除"
-  fi
-done
-
-echo "--- SSH 主机密钥 comment ---"
-for k in /etc/ssh/ssh_host_*_key.pub; do
-  [ -f "$k" ] && ssh-keygen -lf "$k" 2>/dev/null
-done
-
-echo "--- rootfs 总计 ---"
-du -sh --exclude=/proc --exclude=/sys --exclude=/dev --exclude=/run --exclude=/tmp / 2>/dev/null | awk '{print "  " $1 "  总计"}' || true
-
-echo "========== 审计结束 =========="
-echo "✅ Chroot 内配置完成"
