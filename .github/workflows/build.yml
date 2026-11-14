@@ -38,11 +38,11 @@ on:
         required: false
         default: 'rock-5b'
       armbian_release:
-        description: 'Armbian 发行代号'
+        description: 'Armbian 发行代号（rock-5b 只有 trixie/resolute）'
         required: false
         type: choice
-        options: ['bookworm', 'trixie']
-        default: 'bookworm'
+        options: ['trixie', 'resolute', 'bookworm']
+        default: 'trixie'
       armbian_branch:
         description: 'Armbian 分支'
         required: false
