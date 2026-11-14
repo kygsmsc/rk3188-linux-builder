@@ -1,54 +1,31 @@
-# ============================================================
-# parameter.txt — RK3188 盒子 Linux（修正版）
-# 分区偏移与 RKDevTool 截图一致：boot @0x2000，rootfs @0xA000（扇区, 512B）
-# ============================================================
 FIRMWARE_VER:4.2.2
-MACHINE_MODEL:LaDesk 110
+MACHINE_MODEL:rk3188-adesk-std
 MACHINE_ID:007
-MANUFACTURER:RK31SDK
+MANUFACTURER:rk3188
 MAGIC:0x5041524B
 ATAG:0x60000800
 MACHINE:3066
 CHECK_MASK:0x80
 KERNEL_IMG:0x60408000
 
-# ------------------------------------------------------------
-# CMDLINE 说明（对照原 build.yml 第 355 行）:
+# ============================================================
+# parameter.txt — RK3188 盒子 Linux（路线 A 修正版）
 #
-# 【保留】mtdparts=rk29xxnand:...
-#   - 这串同时是原厂 U-Boot / RKDevTool 的分区表：刷机工具按它写镜像、
-#     loader 按它定位 boot 分区（日志里的 FwPartOffset=2000,400 即来源于此），
-#     必须保留，否则工具和 loader 会丢失分区偏移。
-#   - 主线 6.12 内核没有 rk29xxnand mtd 驱动，遇到该参数会自动忽略，
-#     不阻塞启动。
+# 相对教程原版的修改：
+#   [1] mmcblk0p1 → mmcblk1p1
+#       本机 eMMC 是 mmcblk1（TTL 日志：mmcblk1: mmc1:0001 004GA1 3.69 GiB），
+#       教程原版的 mmcblk0p1 在本机会挂根失败。
+#   [2] 删除 initrd=0x62000000,0x00800000
+#       无 initramfs，留着会报 "Initramfs unpacking failed: invalid magic"。
+#   [3] 保留 mtdparts=rk29xxnand:...
+#       loader 用它定义分区布局，RKDevTool "升级固件" 模式按它重写 eMMC MBR。
+#   [4] 保留 dwc_driver=2
+#       老 BSP USB 参数，6.12 忽略。
 #
-# 【保留】dwc_driver=2
-#   - 老 Android BSP 的 USB OTG 驱动选择参数；主线 dwc2 不识别，忽略即可。
-#
-# 【修改】root= 旧写法: /dev/block/mtd/by-name/rootfs
-#   - 这是老 BSP mtd 框架的节点，主线 eMMC 系统不存在。
-#   - 改用 root=LABEL=rootfs（rootfs.img 已 mkfs.ext4 -L rootfs 打标签）。
-#   - 若内核不支持 label 挂载，可改 root=/dev/mmcblk0p4（p 号按 eMMC 实际
-#     分区顺序：Loader/Parameter/boot/rootfs，通常 rootfs 是第 4 个分区）。
-#
-# 【新增】rootwait
-#   - 等 eMMC 枚举完成再挂根，避免启动早期块设备未就绪导致挂根失败。
-#
-# 【console】ttyS2,115200：TTL 实际接 UART2（MMIO 0x20064000）。
-#   日志证据：earlycon 报 "uart0 at MMIO 0x20064000"（0x20064000 即 uart2），
-#   而 8250 驱动只把 0x10124000（uart0）注册为 ttyS0；物理 TTL 能看到 earlycon
-#   阶段输出，说明接线在 uart2。原版 build.yml 第 355 行原本就是 console=ttyS2。
-#   （之前误改成 ttyS0/uart0，导致 console 切到未接线的 uart0，后续日志全部丢失，
-#     表现为"切换后假死"。此处回退到 ttyS2，与 DTS &uart2、chosen stdout-path 对齐。）
-#
-# ------------------------------------------------------------
-# 第二阶段预留（eMMC 无标准分区表时才需要）:
-#   老 mtdparts 只给 loader/BSP 内核用；主线 mmc 层靠 eMMC 上的 GPT/MBR 分区表
-#   识别 mmcblk0pX。若内核日志正常但 blkid 找不到 rootfs 分区，可再加主线
-#   cmdline 分区解析器参数（注意单位是【字节】，需把扇区 ×512 换算）：
-#     blkdevparts=mmcblk0:0x1000000@0x400000(boot),-@0x1400000(rootfs)
-#   并在内核配置打开 CONFIG_CMDLINE_PARTITION。
-# ------------------------------------------------------------
-CMDLINE:console=ttyS2,115200 earlycon root=/dev/mmcblk1p2 rw rootwait rootfstype=ext4 init=/sbin/init maxcpus=1 blkdevparts=mmcblk1:16M@4M(boot),-@20M(rootfs) mtdparts=rk29xxnand:0x00008000@0x00002000(boot),-@0x0000A000(rootfs) dwc_driver=2
-
-
+# 【刷机前必做】
+#   擦除 eMMC 旧 MBR（原厂 Android 分区表残留会导致 mmcblk1p1 只有 2MiB）：
+#     TTL 登录后执行：
+#       dd if=/dev/zero of=/dev/mmcblk1 bs=1M count=1 conv=fsync && sync
+#     然后 RKDevTool 用 "升级固件" 模式刷机（会自动重写 MBR）。
+# ============================================================
+CMDLINE:earlyprintk console=ttyS2,115200 root=/dev/mmcblk1p1 rootfstype=ext4 rw rootwait init=/sbin/init maxcpus=1 mtdparts=rk29xxnand:0x00008000@0x00002000(boot),-@0x0000A000(rootfs) dwc_driver=2
