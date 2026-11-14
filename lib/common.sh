@@ -1,21 +1,56 @@
 #!/bin/bash
 # ============================================================
-# lib/common.sh — RK3188/RK3288 (armhf) 纯净 Ubuntu rootfs 构建核心
-# 由 build_rootfs.sh 调用；CI 与本地 TTL 版共用
+# lib/common.sh — RK3188 纯净 rootfs 构建核心（三发行版）
+#
+# 支持 DISTRO=ubuntu | debian | armbian，三路分发：
+#   ubuntu  : 下载官方 ubuntu-base-*.tar.gz 解压（原方式）
+#   debian  : mmdebstrap 现场构建（最小系统）
+#   armbian : 下载官方 .img.xz，losetup 挂载提取 rootfs 分区
+#
+# 关键环境变量（均有默认值）：
+#   MODE            ttl | usb
+#   DISTRO          ubuntu | debian | armbian（默认 ubuntu）
+#   UBUNTU_VERSION  22.04.5（DISTRO=ubuntu）
+#   UBUNTU_ARCH     armhf
+#   UBUNTU_CODENAME jammy（CI 传入）
+#   DEBIAN_SUITE    bookworm（DISTRO=debian）
+#   DEBIAN_MIRROR   https://mirrors.aliyun.com/debian
+#   DEBIAN_ARCH     armhf
+#   ARMBIAN_BOARD   rock-5b（DISTRO=armbian）
+#   ARMBIAN_RELEASE bookworm
+#   ARMBIAN_BRANCH  current
+#   MIRROR          apt 源（Ubuntu 用）
+#   TARGET_HOSTNAME 主机名
+#   ROOT_PASSWORD   root 密码
+#   TIMEZONE        时区
+#   LOCALES         locale 列表
+#   ROOTFS_DIR      输出目录
+#   MINIMAL_MODE    yes/no（C 级精简）
 #
 # 相对 hi3798 版的关键修复：
-#   [F1] BASE_TARBALL 文件名从 SHA256SUMS 探测（避免 22.04 vs 22.04.5 不一致）
-#   [F2] 支持 UBUNTU_ARCH（armhf / arm64），不再硬编码 armhf
-#   [F3] CODENAME 同时接受 UBUNTU_VERSION 与 CI 传入的 CODENAME
-#   [F4] BASE_URL 优先用环境变量（CI 已拼好 series），fallback 才按版本拼
+#   [F1] BASE_TARBALL 文件名从 SHA256SUMS 探测
+#   [F2] 支持 UBUNTU_ARCH
+#   [F3] CODENAME 兼容 UBUNTU_CODENAME / DEBIAN_SUITE / ARMBIAN_RELEASE
+#   [F4] BASE_URL 优先用环境变量
 #   [F5] fetch 前校验缓存 tar 完整性
+#   [F6] 三路分发（ubuntu/debian/armbian）
+#   [F7] Armbian 提取时排除 /lib/modules，避免与自编译 6.12 模块冲突
 # ============================================================
 set -euo pipefail
 
 MODE="${MODE:?请通过 build_rootfs.sh (ttl) 或 build_usb_rootfs.sh (usb) 调用}"
+DISTRO="${DISTRO:-ubuntu}"
 UBUNTU_VERSION="${UBUNTU_VERSION:-22.04.5}"
 UBUNTU_ARCH="${UBUNTU_ARCH:-armhf}"
 _UBUNTU_SERIES=$(echo "$UBUNTU_VERSION" | cut -d. -f1,2)
+
+DEBIAN_SUITE="${DEBIAN_SUITE:-bookworm}"
+DEBIAN_MIRROR="${DEBIAN_MIRROR:-https://mirrors.aliyun.com/debian}"
+DEBIAN_ARCH="${DEBIAN_ARCH:-armhf}"
+
+ARMBIAN_BOARD="${ARMBIAN_BOARD:-rock-5b}"
+ARMBIAN_RELEASE="${ARMBIAN_RELEASE:-bookworm}"
+ARMBIAN_BRANCH="${ARMBIAN_BRANCH:-current}"
 
 BASE_URL="${BASE_URL:-https://cdimage.ubuntu.com/ubuntu-base/releases/${_UBUNTU_SERIES}/release}"
 MIRROR="${MIRROR:-http://repo.huaweicloud.com/ubuntu-ports}"
@@ -27,22 +62,30 @@ ROOT_PASSWORD="${ROOT_PASSWORD:-root123}"
 TIMEZONE="${TIMEZONE:-Asia/Shanghai}"
 LOCALES="${LOCALES:-en_US.UTF-8 zh_CN.UTF-8}"
 
+# [F3] CODENAME 兼容三发行版
 if [ -z "${UBUNTU_CODENAME:-}" ]; then
-  case "$_UBUNTU_SERIES" in
-    20.04) UBUNTU_CODENAME="focal" ;;
-    22.04) UBUNTU_CODENAME="jammy" ;;
-    24.04) UBUNTU_CODENAME="noble" ;;
-    *)     echo "⚠️  未知版本 $UBUNTU_VERSION，默认 focal" >&2; UBUNTU_CODENAME="focal" ;;
+  case "$DISTRO" in
+    debian)  UBUNTU_CODENAME="${DEBIAN_SUITE}" ;;
+    armbian) UBUNTU_CODENAME="${ARMBIAN_RELEASE}" ;;
+    *)
+      case "$_UBUNTU_SERIES" in
+        20.04) UBUNTU_CODENAME="focal" ;;
+        22.04) UBUNTU_CODENAME="jammy" ;;
+        24.04) UBUNTU_CODENAME="noble" ;;
+        *)     echo "⚠️  未知版本 $UBUNTU_VERSION，默认 jammy" >&2; UBUNTU_CODENAME="jammy" ;;
+      esac
+      ;;
   esac
 fi
 export UBUNTU_CODENAME
 
-echo "==> [common.sh] UBUNTU_VERSION=$UBUNTU_VERSION  UBUNTU_ARCH=$UBUNTU_ARCH  CODENAME=$UBUNTU_CODENAME"
+echo "==> [common.sh] DISTRO=$DISTRO  CODENAME=$UBUNTU_CODENAME  ARCH=$UBUNTU_ARCH"
 echo "==> [common.sh] TARGET_HOSTNAME=$TARGET_HOSTNAME"
 echo "==> [common.sh] CUSTOM_MAC=${CUSTOM_MAC:-(未设置)}"
 echo "==> [common.sh] MINIMAL_MODE=$MINIMAL_MODE"
-echo "==> [common.sh] BASE_URL=$BASE_URL"
-echo "==> [common.sh] MIRROR=$MIRROR"
+[ "$DISTRO" = "ubuntu" ] && echo "==> [common.sh] BASE_URL=$BASE_URL  MIRROR=$MIRROR"
+[ "$DISTRO" = "debian" ] && echo "==> [common.sh] DEBIAN_MIRROR=$DEBIAN_MIRROR"
+[ "$DISTRO" = "armbian" ] && echo "==> [common.sh] ARMBIAN_BOARD=$ARMBIAN_BOARD RELEASE=$ARMBIAN_RELEASE BRANCH=$ARMBIAN_BRANCH"
 
 case "$MODE" in
   ttl) DEFAULT_ROOTFS_DIR="$(pwd)/pure_rootfs" ;;
@@ -69,9 +112,14 @@ cleanup_mounts() {
   for m in tmp var/cache/apt/archives dev/pts dev sys proc; do
     $SUDO umount -lf "$ROOTFS_DIR/$m" 2>/dev/null || true
   done
+  # Armbian 提取时可能残留的临时挂载
+  $SUDO umount -lf "$(pwd)/mnt_armbian_tmp" 2>/dev/null || true
 }
 trap cleanup_mounts EXIT INT TERM
 
+# ============================================================
+# 【Ubuntu 路径】
+# ============================================================
 resolve_base_tarball() {
   local sums="cache/SHA256SUMS"
   local probe=""
@@ -85,7 +133,7 @@ resolve_base_tarball() {
   fi
 }
 
-fetch_base() {
+fetch_ubuntu_base() {
   log "下载 Ubuntu Base $UBUNTU_VERSION ($UBUNTU_ARCH)..."
   mkdir -p cache
   wget -q --tries=3 --timeout=30 -O cache/SHA256SUMS "$BASE_URL/SHA256SUMS" 2>/dev/null \
@@ -93,7 +141,6 @@ fetch_base() {
   resolve_base_tarball
   log "目标文件: $BASE_TARBALL"
   log "来源: $BASE_URL/$BASE_TARBALL"
-
   (
     cd cache
     if [ -f "$BASE_TARBALL" ] && ! tar -tzf "$BASE_TARBALL" >/dev/null 2>&1; then
@@ -105,16 +152,13 @@ fetch_base() {
       if grep -F "$BASE_TARBALL" SHA256SUMS | sha256sum -c - >/dev/null 2>&1; then
         echo "✅ SHA256 校验通过"
       else
-        echo "❌ SHA256 校验失败" >&2
-        exit 1
+        echo "❌ SHA256 校验失败" >&2; exit 1
       fi
-    else
-      echo "⚠️  无 SHA256SUMS 或无匹配项，跳过校验"
     fi
   )
 }
 
-prepare_rootfs() {
+prepare_ubuntu_rootfs() {
   log "准备目录: $ROOTFS_DIR"
   $SUDO rm -rf "$ROOTFS_DIR"
   mkdir -p "$ROOTFS_DIR"
@@ -123,6 +167,118 @@ prepare_rootfs() {
   $SUDO chown root:root "$ROOTFS_DIR"
 }
 
+# ============================================================
+# 【Debian 路径】mmdebstrap 现场构建
+# ============================================================
+build_debian_rootfs() {
+  log "构建 Debian $DEBIAN_SUITE ($DEBIAN_ARCH) rootfs via mmdebstrap..."
+
+  if ! command -v mmdebstrap >/dev/null 2>&1; then
+    log "安装 mmdebstrap..."
+    $SUDO apt-get update -qq
+    $SUDO apt-get install -y -qq mmdebstrap qemu-user-static binfmt-support
+  fi
+
+  $SUDO rm -rf "$ROOTFS_DIR"
+  mkdir -p "$ROOTFS_DIR"
+
+  # minbase 只装最小系统；--include 预装必要包，减少 chroot 内 apt 时间
+  $SUDO mmdebstrap \
+    --architectures="$DEBIAN_ARCH" \
+    --variant=minbase \
+    --components="main" \
+    --include="apt-utils,ca-certificates,locales,tzdata,systemd,systemd-sysv,dbus,udev,e2fsprogs,openssh-server,sudo,iproute2,ifupdown,isc-dhcp-client,network-manager,wpasupplicant,iw,rfkill,iptables,file,procps" \
+    "$DEBIAN_SUITE" \
+    "$ROOTFS_DIR" \
+    "$DEBIAN_MIRROR"
+
+  $SUDO chown root:root "$ROOTFS_DIR"
+  log "Debian rootfs 基础包安装完成"
+}
+
+# ============================================================
+# 【Armbian 路径】下载官方镜像，提取 rootfs 分区
+# ============================================================
+build_armbian_rootfs() {
+  log "构建 Armbian ${ARMBIAN_BOARD} ${ARMBIAN_RELEASE} (${ARMBIAN_BRANCH}) rootfs..."
+
+  for t in losetup mount xz rsync; do
+    command -v "$t" >/dev/null 2>&1 || {
+      log "安装缺失工具: $t"
+      $SUDO apt-get update -qq
+      $SUDO apt-get install -y -qq util-linux mount xz-utils rsync
+    }
+  done
+
+  mkdir -p cache
+  local tag="${ARMBIAN_BOARD}-${ARMBIAN_RELEASE}-${ARMBIAN_BRANCH}"
+  local img_xz="cache/armbian-${tag}.img.xz"
+  local img="cache/armbian-${tag}.img"
+
+  if [ ! -f "$img_xz" ]; then
+    local release_cap
+    release_cap=$(echo "${ARMBIAN_RELEASE}" | sed 's/^./\U&/')
+    local url="https://dl.armbian.com/${ARMBIAN_BOARD}/${release_cap}_${ARMBIAN_BRANCH}_minimal"
+    log "下载 Armbian 镜像: $url"
+    wget -q -c --tries=5 --timeout=600 "$url" -O "$img_xz" || {
+      echo "❌ Armbian 镜像下载失败"; exit 1
+    }
+  fi
+
+  if [ ! -f "$img" ] || [ "$img_xz" -nt "$img" ]; then
+    log "解压 Armbian 镜像..."
+    xz -dkc "$img_xz" > "$img"
+  fi
+
+  log "挂载 Armbian 镜像提取 rootfs..."
+  local loop_dev
+  loop_dev=$($SUDO losetup -fP --show "$img") || { echo "❌ losetup 失败"; exit 1; }
+  sleep 2
+
+  local root_part
+  root_part=$($SUDO lsblk -lnpo NAME,SIZE "$loop_dev" | sort -k2 -n | tail -1 | awk '{print $1}')
+  if [ -z "$root_part" ]; then
+    echo "❌ 找不到 rootfs 分区"
+    $SUDO losetup -d "$loop_dev"
+    exit 1
+  fi
+
+  $SUDO rm -rf "$ROOTFS_DIR"
+  mkdir -p "$ROOTFS_DIR"
+  local mnt_tmp="mnt_armbian_tmp"
+  rm -rf "$mnt_tmp"; mkdir -p "$mnt_tmp"
+
+  $SUDO mount -o ro "$root_part" "$mnt_tmp" || {
+    echo "❌ 挂载 rootfs 分区失败"
+    $SUDO losetup -d "$loop_dev"
+    exit 1
+  }
+
+  log "复制 rootfs 内容（排除伪文件系统 + /lib/modules）..."
+  # [F7] 排除 /lib/modules：Armbian 自带模块与 6.12 内核不匹配，
+  #      后续 CI 会 modules_install 覆盖
+  $SUDO rsync -aHAX \
+    --exclude=/proc/* --exclude=/sys/* --exclude=/dev/* \
+    --exclude=/run/* --exclude=/tmp/* \
+    --exclude=/var/cache/apt/archives/* \
+    --exclude=/lib/modules/* \
+    --exclude=/etc/armbian \
+    --exclude=/etc/firstboot.d \
+    --exclude=/etc/armbian-firstlogin \
+    --exclude=/var/log/* \
+    "$mnt_tmp/" "$ROOTFS_DIR/"
+
+  $SUDO umount "$mnt_tmp"
+  rmdir "$mnt_tmp"
+  $SUDO losetup -d "$loop_dev"
+
+  $SUDO chown root:root "$ROOTFS_DIR"
+  log "Armbian rootfs 提取完成"
+}
+
+# ============================================================
+# Chroot 环境准备（三发行版共用）
+# ============================================================
 setup_chroot_env() {
   log "准备 Chroot 环境..."
   if [ ! -f /usr/bin/qemu-arm-static ]; then
@@ -148,10 +304,12 @@ write_inner_script() {
 run_inner() {
   log "在 Chroot 中执行安装配置（耗时较长）..."
   $SUDO chroot "$ROOTFS_DIR" /usr/bin/env \
-    MODE="$MODE" MIRROR="$MIRROR" HOSTNAME="$TARGET_HOSTNAME" \
+    MODE="$MODE" DISTRO="$DISTRO" MIRROR="$MIRROR" HOSTNAME="$TARGET_HOSTNAME" \
     ROOT_PASSWORD="$ROOT_PASSWORD" TIMEZONE="$TIMEZONE" LOCALES="$LOCALES" \
     UBUNTU_CODENAME="$UBUNTU_CODENAME" CUSTOM_MAC="$CUSTOM_MAC" \
     MINIMAL_MODE="$MINIMAL_MODE" \
+    DEBIAN_MIRROR="$DEBIAN_MIRROR" DEBIAN_SUITE="$DEBIAN_SUITE" \
+    ARMBIAN_RELEASE="$ARMBIAN_RELEASE" \
     /bin/bash /tmp/rootfs_inner.sh
 }
 
@@ -179,17 +337,14 @@ finish() {
       ! -name '.bashrc' ! -name '.profile' ! -name '.bash_logout' \
       ! -name '.cache' ! -name '.local' 2>/dev/null)
   if [ -n "$BAD_ROOT" ]; then
-    echo "❌ /root 非标准:"
-    echo "$BAD_ROOT"
-    FAIL=1
+    echo "❌ /root 非标准:"; echo "$BAD_ROOT"; FAIL=1
   fi
 
   local TMP_COUNT
   TMP_COUNT=$($SUDO find "$ROOTFS_DIR/tmp" -mindepth 1 2>/dev/null | wc -l)
   if [ "$TMP_COUNT" -ne 0 ]; then
     echo "❌ /tmp 非空: $TMP_COUNT 条目"
-    $SUDO ls -la "$ROOTFS_DIR/tmp/"
-    FAIL=1
+    $SUDO ls -la "$ROOTFS_DIR/tmp/"; FAIL=1
   fi
 
   if [ "$FAIL" -ne 0 ]; then
@@ -203,14 +358,20 @@ finish() {
   local SIZE
   SIZE="$($SUDO du -sh "$ROOTFS_DIR" | cut -f1)"
   echo "=============================================="
-  echo "✅ ${MODE} 版纯净根文件系统构建完成: $ROOTFS_DIR ($SIZE)"
+  echo "✅ ${MODE} 版 ${DISTRO} 纯净根文件系统构建完成: $ROOTFS_DIR ($SIZE)"
   echo "=============================================="
 }
 
+# [F6] 三路分发
 main() {
-  log "开始构建 ${MODE} 版纯净根文件系统"
-  fetch_base
-  prepare_rootfs
+  log "开始构建 ${MODE} 版 ${DISTRO} 纯净根文件系统"
+
+  case "${DISTRO}" in
+    debian)  build_debian_rootfs ;;
+    armbian) build_armbian_rootfs ;;
+    ubuntu|*) fetch_ubuntu_base; prepare_ubuntu_rootfs ;;
+  esac
+
   setup_chroot_env
   write_inner_script
   run_inner
