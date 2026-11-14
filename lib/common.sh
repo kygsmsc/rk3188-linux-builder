@@ -2,30 +2,6 @@
 # ============================================================
 # lib/common.sh — RK3188 纯净 rootfs 构建核心（三发行版）
 #
-# 支持 DISTRO=ubuntu | debian | armbian：
-#   ubuntu  : 下载官方 ubuntu-base-*.tar.gz 解压
-#   debian  : 下载 LXC 预构建 rootfs.tar.xz（绕过 mmdebstrap/GPG）
-#   armbian : 从镜像站下载 .img.xz，losetup 挂载提取 rootfs
-#
-# 关键环境变量（均有默认值）：
-#   MODE            ttl | usb
-#   DISTRO          ubuntu | debian | armbian（默认 ubuntu）
-#   UBUNTU_VERSION  22.04.5（DISTRO=ubuntu）
-#   UBUNTU_ARCH     armhf
-#   UBUNTU_CODENAME jammy（CI 传入；也可由 UBUNTU_VERSION 推导）
-#   DEBIAN_SUITE    bookworm（DISTRO=debian）
-#   DEBIAN_ARCH     armhf
-#   ARMBIAN_BOARD   rock-5b（DISTRO=armbian）
-#   ARMBIAN_RELEASE bookworm
-#   ARMBIAN_BRANCH  legacy
-#   MIRROR          apt 源（Ubuntu 用）
-#   TARGET_HOSTNAME 主机名
-#   ROOT_PASSWORD   root 密码
-#   TIMEZONE        时区
-#   LOCALES         locale 列表
-#   ROOTFS_DIR      输出目录
-#   MINIMAL_MODE    yes/no（C 级精简）
-#
 # 修复记录：
 #   [F1] BASE_TARBALL 文件名从 SHA256SUMS 探测
 #   [F2] 支持 UBUNTU_ARCH
@@ -34,12 +10,14 @@
 #   [F5] fetch 前校验缓存 tar 完整性
 #   [F6] 三路分发
 #   [F7] Armbian 提取时排除 /lib/modules
-#   [F8] Debian 改用 LXC 预构建 rootfs.tar.xz（解决 NO_PUBKEY）
-#   [F9] Armbian 通配符精确匹配镜像站实际文件名
+#   [F8] Debian 改用 LXC 预构建 rootfs.tar.xz
+#   [F9] Armbian 通配符精确匹配 + release 自动降级
+#   [F10] Debian: resolv.conf 符号链接导致 cp 失败 → 先删再拷
+#   [F11] Armbian: rock-5b/archive 无 bookworm，自动降级到 trixie/resolute
 # ============================================================
 set -euo pipefail
 
-MODE="${MODE:?请通过 build_rootfs.sh (ttl) 或 build_usb_rootfs.sh (usb) 调用}"
+MODE="${MODE:?请通过 build_rootfs.sh 调用}"
 DISTRO="${DISTRO:-ubuntu}"
 UBUNTU_VERSION="${UBUNTU_VERSION:-22.04.5}"
 UBUNTU_ARCH="${UBUNTU_ARCH:-armhf}"
@@ -49,8 +27,8 @@ DEBIAN_SUITE="${DEBIAN_SUITE:-bookworm}"
 DEBIAN_ARCH="${DEBIAN_ARCH:-armhf}"
 
 ARMBIAN_BOARD="${ARMBIAN_BOARD:-rock-5b}"
-ARMBIAN_RELEASE="${ARMBIAN_RELEASE:-bookworm}"
-ARMBIAN_BRANCH="${ARMBIAN_BRANCH:-legacy}"
+ARMBIAN_RELEASE="${ARMBIAN_RELEASE:-trixie}"   # [F11] rock-5b 实际只有 trixie/resolute
+ARMBIAN_BRANCH="${ARMBIAN_BRANCH:-current}"
 
 MIRROR="${MIRROR:-http://repo.huaweicloud.com/ubuntu-ports}"
 
@@ -61,7 +39,6 @@ ROOT_PASSWORD="${ROOT_PASSWORD:-root123}"
 TIMEZONE="${TIMEZONE:-Asia/Shanghai}"
 LOCALES="${LOCALES:-en_US.UTF-8 zh_CN.UTF-8}"
 
-# [F3] CODENAME：Ubuntu 必须用代号（jammy），不能用版本号
 if [ -z "${UBUNTU_CODENAME:-}" ]; then
   case "$DISTRO" in
     debian)  UBUNTU_CODENAME="${DEBIAN_SUITE}" ;;
@@ -71,14 +48,13 @@ if [ -z "${UBUNTU_CODENAME:-}" ]; then
         20.04) UBUNTU_CODENAME="focal" ;;
         22.04) UBUNTU_CODENAME="jammy" ;;
         24.04) UBUNTU_CODENAME="noble" ;;
-        *)     echo "⚠️  未知版本 $UBUNTU_VERSION，默认 jammy" >&2; UBUNTU_CODENAME="jammy" ;;
+        *)     UBUNTU_CODENAME="jammy" ;;
       esac
       ;;
   esac
 fi
 export UBUNTU_CODENAME
 
-# [F4] Ubuntu Base URL：用代号拼完整路径
 BASE_URL="${BASE_URL:-}"
 if [ "$DISTRO" = "ubuntu" ]; then
   if [ -z "$BASE_URL" ] || ! echo "$BASE_URL" | grep -qE "/${UBUNTU_CODENAME}/release/?$"; then
@@ -96,7 +72,7 @@ echo "==> [common.sh] MINIMAL_MODE=$MINIMAL_MODE"
 case "$MODE" in
   ttl) DEFAULT_ROOTFS_DIR="$(pwd)/pure_rootfs" ;;
   usb) DEFAULT_ROOTFS_DIR="$(pwd)/usb_pure_rootfs" ;;
-  *)   echo "❌ 未知 MODE: $MODE" >&2; exit 1 ;;
+  *)   exit 1 ;;
 esac
 ROOTFS_DIR="${ROOTFS_DIR:-$DEFAULT_ROOTFS_DIR}"
 BASE_TARBALL=""
@@ -157,8 +133,6 @@ prepare_ubuntu_rootfs() {
 
 # ============================================================
 # Debian — [F8] LXC 预构建 rootfs.tar.xz
-# 镜像站: https://images.linuxcontainers.org/images/debian/
-# 结构: <suite>/<arch>/default/<date>/rootfs.tar.xz
 # ============================================================
 build_debian_rootfs() {
   log "下载 Debian $DEBIAN_SUITE ($DEBIAN_ARCH) rootfs from linuxcontainers.org..."
@@ -171,7 +145,6 @@ build_debian_rootfs() {
 
   if [ ! -f "$tar_xz" ]; then
     log "获取最新构建日期: $base/"
-    # 目录列表里的日期格式有两种：20261113_05:24 或 URL 编码 20261113_05%3A24
     local latest_date
     latest_date=$(wget -q -O - "$base/" 2>/dev/null \
       | grep -oE '[0-9]{8}_[0-9]{2}(%3A|:)[0-9]{2}/' \
@@ -183,7 +156,6 @@ build_debian_rootfs() {
       exit 1
     fi
 
-    # URL 编码：: → %3A
     local date_encoded="${latest_date//:/%3A}"
     local url="${base}/${date_encoded}/rootfs.tar.xz"
     log "下载: $url"
@@ -199,7 +171,7 @@ build_debian_rootfs() {
   $SUDO tar --numeric-owner -xJpf "$tar_xz" -C "$ROOTFS_DIR"
   $SUDO chown root:root "$ROOTFS_DIR"
 
-  # LXC 镜像可能缺 systemd-sysv（默认用 sysvinit），先确保 systemd 是 init
+  # LXC 镜像可能缺 systemd-sysv
   if [ ! -e "$ROOTFS_DIR/sbin/init" ] && [ -d "$ROOTFS_DIR/lib/systemd" ]; then
     log "修复 /sbin/init → systemd"
     $SUDO ln -sf /lib/systemd/systemd "$ROOTFS_DIR/sbin/init"
@@ -209,8 +181,9 @@ build_debian_rootfs() {
 }
 
 # ============================================================
-# Armbian — [F9] 精确匹配镜像站文件名
-# 实际格式: Armbian_23.2.1_Rock-5b_bookworm_legacy_5.10.160_minimal.img.xz
+# Armbian — [F9][F11] 精确匹配 + release 自动降级
+# 镜像站实际只有 trixie/resolute，没有 bookworm
+# 文件名格式: Armbian_<ver>_<Board>_<release>_<branch>_<kernel>_minimal.img.xz
 # ============================================================
 build_armbian_rootfs() {
   log "构建 Armbian ${ARMBIAN_BOARD} ${ARMBIAN_RELEASE} (${ARMBIAN_BRANCH}) rootfs..."
@@ -232,33 +205,42 @@ build_armbian_rootfs() {
     board_cap=$(echo "${ARMBIAN_BOARD}" | sed 's/./\U&/')
     local mirrors=(
       "https://mirrors.tuna.tsinghua.edu.cn/armbian-releases/${ARMBIAN_BOARD}/archive"
-      "https://mirrors.nju.edu.cn/armbian-releases/${ARMBIAN_BOARD}/archive"
       "https://mirrors.bfsu.edu.cn/armbian-releases/${ARMBIAN_BOARD}/archive"
-      "https://mirrors.ustc.edu.cn/armbian-releases/${ARMBIAN_BOARD}/archive"
     )
+
+    # [F11] release 候选列表：先用用户指定的，失败则按 trixie → resolute 降级
+    local release_candidates=("${ARMBIAN_RELEASE}")
+    for r in trixie resolute bookworm; do
+      [ "$r" != "${ARMBIAN_RELEASE}" ] && release_candidates+=("$r")
+    done
 
     local filename=""
     local url=""
-    local base=""
-    for base in "${mirrors[@]}"; do
-      log "从镜像站查找: ${base}/"
-      # [F9] 精确匹配：Armbian_<ver>_<Board>_<release>_<branch>_<kernel>_minimal.img.xz
-      filename=$(wget -q -O - "$base/" 2>/dev/null \
-        | grep -oE "Armbian_[0-9.]+_${board_cap}_${ARMBIAN_RELEASE}_[a-z]+_[0-9.]+_minimal\.img\.xz" \
-        | head -1 || true)
-      if [ -n "$filename" ]; then
-        url="${base}/${filename}"
-        log "找到: $filename"
-        break
-      fi
+    local matched_release=""
+
+    for rel in "${release_candidates[@]}"; do
+      log "尝试 release: $rel"
+      for base in "${mirrors[@]}"; do
+        log "  从镜像站查找: ${base}/"
+        # 精确匹配 Armbian_<ver>_<Board>_<release>_<branch>_<kernel>_minimal.img.xz
+        filename=$(wget -q -O - "$base/" 2>/dev/null \
+          | grep -oE "Armbian_[0-9.]+_${board_cap}_${rel}_[a-z]+_[0-9.]+_minimal\.img\.xz" \
+          | head -1 || true)
+        if [ -n "$filename" ]; then
+          url="${base}/${filename}"
+          matched_release="$rel"
+          log "  ✅ 找到: $filename"
+          break 2
+        fi
+      done
     done
 
-    # 二次兜底：放宽到包含 board+release+minimal 的任意文件
+    # 最终兜底：任意包含 board + minimal 的文件
     if [ -z "$url" ]; then
       for base in "${mirrors[@]}"; do
         filename=$(wget -q -O - "$base/" 2>/dev/null \
           | grep -oE 'Armbian_[^"<>[:space:]]+\.img\.xz' \
-          | grep "_${board_cap}_${ARMBIAN_RELEASE}_" \
+          | grep "_${board_cap}_" \
           | grep '_minimal\.img\.xz$' \
           | sort -V | tail -1 || true)
         if [ -n "$filename" ]; then
@@ -271,9 +253,20 @@ build_armbian_rootfs() {
 
     if [ -z "$url" ]; then
       echo "❌ 找不到 Armbian 镜像"
-      echo "   板型: ${ARMBIAN_BOARD}  release: ${ARMBIAN_RELEASE}"
-      echo "   请访问 https://mirrors.nju.edu.cn/armbian-releases/${ARMBIAN_BOARD}/archive/ 确认"
+      echo "   板型: ${ARMBIAN_BOARD}"
+      echo "   尝试过 release: ${release_candidates[*]}"
+      echo "   请访问 https://mirrors.tuna.tsinghua.edu.cn/armbian-releases/${ARMBIAN_BOARD}/archive/ 确认"
       exit 1
+    fi
+
+    # 如果降级了，更新 tag 和文件名
+    if [ -n "$matched_release" ] && [ "$matched_release" != "${ARMBIAN_RELEASE}" ]; then
+      log "⚠️  release 降级: ${ARMBIAN_RELEASE} → ${matched_release}"
+      ARMBIAN_RELEASE="$matched_release"
+      UBUNTU_CODENAME="$matched_release"
+      tag="${ARMBIAN_BOARD}-${ARMBIAN_RELEASE}-${ARMBIAN_BRANCH}"
+      img_xz="cache/armbian-${tag}.img.xz"
+      img="cache/armbian-${tag}.img"
     fi
 
     log "下载 Armbian 镜像: $url"
@@ -304,7 +297,6 @@ build_armbian_rootfs() {
     echo "❌ 挂载失败"; $SUDO losetup -d "$loop_dev"; exit 1
   }
 
-  # [F7] 排除 /lib/modules：Armbian 自带模块与 6.12 内核不匹配
   $SUDO rsync -aHAX \
     --exclude=/proc/* --exclude=/sys/* --exclude=/dev/* \
     --exclude=/run/* --exclude=/tmp/* \
@@ -319,11 +311,11 @@ build_armbian_rootfs() {
   $SUDO umount "$mnt_tmp"; rmdir "$mnt_tmp"
   $SUDO losetup -d "$loop_dev"
   $SUDO chown root:root "$ROOTFS_DIR"
-  log "Armbian rootfs 提取完成"
+  log "Armbian rootfs 提取完成 (release=${ARMBIAN_RELEASE})"
 }
 
 # ============================================================
-# Chroot 环境（共用）
+# Chroot 环境（[F10] 修复 resolv.conf 符号链接）
 # ============================================================
 setup_chroot_env() {
   log "准备 Chroot 环境..."
@@ -332,7 +324,11 @@ setup_chroot_env() {
   fi
   $SUDO cp /usr/bin/qemu-arm-static "$ROOTFS_DIR/usr/bin/"
   command -v update-binfmts >/dev/null 2>&1 && $SUDO update-binfmts --enable qemu-arm 2>/dev/null || true
+
+  # [F10] 先删掉目标 resolv.conf（LXC 镜像里是符号链接），再复制
+  $SUDO rm -f "$ROOTFS_DIR/etc/resolv.conf"
   $SUDO cp /etc/resolv.conf "$ROOTFS_DIR/etc/resolv.conf"
+
   $SUDO mkdir -p "$ROOTFS_DIR"/{proc,sys,dev,dev/pts,tmp,var/cache/apt/archives}
   $SUDO mount -t proc proc "$ROOTFS_DIR/proc"
   $SUDO mount -t sysfs sysfs "$ROOTFS_DIR/sys"
@@ -353,7 +349,7 @@ run_inner() {
     ROOT_PASSWORD="$ROOT_PASSWORD" TIMEZONE="$TIMEZONE" LOCALES="$LOCALES" \
     UBUNTU_CODENAME="$UBUNTU_CODENAME" CUSTOM_MAC="$CUSTOM_MAC" \
     MINIMAL_MODE="$MINIMAL_MODE" \
-    DEBIAN_MIRROR="$DEBIAN_MIRROR" DEBIAN_SUITE="$DEBIAN_SUITE" \
+    DEBIAN_SUITE="$DEBIAN_SUITE" \
     ARMBIAN_RELEASE="$ARMBIAN_RELEASE" \
     /bin/bash /tmp/rootfs_inner.sh
 }
@@ -387,7 +383,6 @@ finish() {
   echo "✅ ${MODE} 版 ${DISTRO} 构建完成: $ROOTFS_DIR ($SIZE)"
 }
 
-# [F6] 三路分发
 main() {
   log "开始构建 ${MODE} 版 ${DISTRO} 纯净根文件系统"
   case "${DISTRO}" in
