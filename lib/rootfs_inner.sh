@@ -1,5 +1,9 @@
 #!/bin/bash
 # lib/rootfs_inner.sh — chroot 内配置（三发行版兼容）
+#   [D1] APT 源按 DISTRO 分支（ubuntu/debian/armbian）
+#   [D2] rsyslog/bash-completion 仅 Ubuntu
+#   [D3] systemd-resolved 仅 Ubuntu；Debian/Armbian 用传统 resolv.conf
+#   [D4] LXC Debian 镜像可能缺 systemd-sysv，先确保 systemd 安装
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 export LC_ALL=C LANG=C
@@ -12,6 +16,7 @@ mount -t tmpfs tmpfs /tmp 2>/dev/null || true
 mkdir -p /var/cache/apt/archives
 mount -t tmpfs tmpfs /var/cache/apt/archives 2>/dev/null || true
 
+# ========== APT 最小化 ==========
 cat > /etc/apt/apt.conf.d/99minimize << 'APTCONF'
 APT::Install-Recommends "false";
 APT::Install-Suggests "false";
@@ -36,23 +41,23 @@ Acquire::IndexTargets::deb::DEP-11-icons-large::DefaultEnabled "false";
 Acquire::Languages "none";
 APTCONF
 
-# CODENAME 必须是代号（jammy/bookworm），不是版本号
 CODENAME="${UBUNTU_CODENAME:-jammy}"
 echo "==> 发行版: $DISTRO  代号: $CODENAME"
 
+# ========== [D1] APT 源 ==========
 case "${DISTRO}" in
   debian)
     cat > /etc/apt/sources.list << SOURCES
-deb ${DEBIAN_MIRROR:-https://mirrors.aliyun.com/debian} ${CODENAME} main
-deb ${DEBIAN_MIRROR:-https://mirrors.aliyun.com/debian} ${CODENAME}-updates main
-deb ${DEBIAN_MIRROR:-https://mirrors.aliyun.com/debian-security} ${CODENAME}-security main
+deb http://deb.debian.org/debian ${CODENAME} main
+deb http://deb.debian.org/debian ${CODENAME}-updates main
+deb http://deb.debian.org/debian-security ${CODENAME}-security main
 SOURCES
     ;;
   armbian)
     cat > /etc/apt/sources.list << SOURCES
-deb ${DEBIAN_MIRROR:-https://mirrors.aliyun.com/debian} ${CODENAME} main contrib non-free non-free-firmware
-deb ${DEBIAN_MIRROR:-https://mirrors.aliyun.com/debian} ${CODENAME}-updates main contrib non-free non-free-firmware
-deb ${DEBIAN_MIRROR:-https://mirrors.aliyun.com/debian-security} ${CODENAME}-security main contrib non-free non-free-firmware
+deb http://deb.debian.org/debian ${CODENAME} main contrib non-free non-free-firmware
+deb http://deb.debian.org/debian ${CODENAME}-updates main contrib non-free non-free-firmware
+deb http://deb.debian.org/debian-security ${CODENAME}-security main contrib non-free non-free-firmware
 SOURCES
     rm -f /etc/apt/sources.list.d/armbian*.list 2>/dev/null || true
     ;;
@@ -84,9 +89,18 @@ SOURCES
     ;;
 esac
 
+# [D4] LXC Debian 镜像可能没有 systemd-sysv，先确保 apt 能工作
+if [ "${DISTRO}" = "debian" ]; then
+  # LXC 镜像通常已带 debian-archive-keyring，若没有则先装
+  if ! dpkg -l debian-archive-keyring >/dev/null 2>&1; then
+    apt-get install -y -qq debian-archive-keyring 2>/dev/null || true
+  fi
+fi
+
 apt-get update -qq
 apt-get -f install -y -qq 2>&1 || true
 
+# ========== 软件包列表 ==========
 PKGS="systemd systemd-sysv dbus udev \
   ifupdown isc-dhcp-client iproute2 iputils-ping iputils-arping procps \
   openssh-server ssh sudo e2fsprogs ca-certificates \
@@ -97,11 +111,13 @@ PKGS="systemd systemd-sysv dbus udev \
 
 apt-get install -y -qq --no-install-recommends $PKGS
 
+# ========== [P12] iptables legacy ==========
 if [ -x /usr/sbin/iptables-legacy ]; then
     update-alternatives --set iptables /usr/sbin/iptables-legacy 2>/dev/null || true
     update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy 2>/dev/null || true
 fi
 
+# ========== USB 存储支持 ==========
 apt-get install -y -qq --no-install-recommends \
   util-linux usbutils dosfstools ntfs-3g exfat-fuse eject
 
@@ -155,6 +171,7 @@ esac
 SCRIPT
 chmod +x /usr/local/sbin/usb-mount.sh
 
+# ========== 基础系统配置 ==========
 echo "$HOSTNAME" > /etc/hostname
 hostname "$HOSTNAME" 2>/dev/null || true
 cat > /etc/hosts << HOSTS
@@ -176,6 +193,7 @@ FSTAB
 echo "root:$ROOT_PASSWORD" | chpasswd
 sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config 2>/dev/null || true
 
+# ========== firstboot-password ==========
 printf '%s\n' "$ROOT_PASSWORD" > /etc/firstboot-pwd.txt
 chmod 600 /etc/firstboot-pwd.txt
 cat > /usr/local/sbin/firstboot-password.sh << 'SH'
@@ -205,6 +223,7 @@ WantedBy=multi-user.target
 SVC
 systemctl enable firstboot-password.service 2>/dev/null || true
 
+# ========== 网络：NM 管理 eth0 ==========
 rm -f /etc/network/interfaces.d/eth0
 cat > /etc/network/interfaces << 'NETIF'
 auto lo
@@ -251,6 +270,7 @@ NMETH0
 fi
 chmod 600 /etc/NetworkManager/system-connections/eth0.nmconnection
 
+# ========== locale ==========
 cat > /etc/locale.gen << 'LGEN'
 en_US.UTF-8 UTF-8
 zh_CN.UTF-8 UTF-8
@@ -263,16 +283,20 @@ LOCALE
 update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 >/dev/null 2>&1 || true
 
 systemd-machine-id-setup 2>/dev/null || true
+
+# ========== SSH 主机密钥 ==========
 rm -f /etc/ssh/ssh_host_*
 for _t in rsa ecdsa ed25519; do
   ssh-keygen -t "$_t" -N '' -f "/etc/ssh/ssh_host_${_t}_key" -C "root@${HOSTNAME}" -q >/dev/null 2>&1 || true
 done
 
+# ========== 服务 ==========
 systemctl enable ssh networking NetworkManager systemd-timesyncd 2>/dev/null || true
 systemctl mask motd-news.timer apt-daily.timer apt-daily-upgrade.timer dpkg-db-backup.timer 2>/dev/null || true
 systemctl set-default multi-user.target 2>/dev/null || true
 systemctl enable serial-getty@ttyS2.service 2>/dev/null || true
 
+# [D3] resolved 仅 Ubuntu
 if [ "${DISTRO}" = "ubuntu" ]; then
   systemctl enable systemd-resolved 2>/dev/null || true
   mkdir -p /etc/systemd/resolved.conf.d
@@ -293,6 +317,7 @@ cat > /etc/systemd/timesyncd.conf << 'NTP'
 NTP=ntp.aliyun.com ntp.tencent.com cn.pool.ntp.org
 NTP
 
+# ========== 清理 ==========
 apt-get autoremove -y --purge
 apt-get clean
 rm -rf /var/tmp/* /tmp/* /root/.cache 2>/dev/null || true
@@ -317,6 +342,7 @@ find /root -mindepth 1 -maxdepth 1 \
 find /tmp  -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
 find /home -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
 
+# ========== 审计 ==========
 echo "========== 审计 =========="
 echo "DISTRO=$DISTRO CODENAME=$CODENAME"
 cat /etc/apt/sources.list 2>/dev/null || cat /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null
