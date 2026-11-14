@@ -1,14 +1,8 @@
-name: 编译 Rockchip 刷机包 (RK3188)
+name: 编译 Rockchip 刷机包 (RK3188 三发行版)
 
 on:
   workflow_dispatch:
     inputs:
-      distro:
-        description: 'rootfs 发行版'
-        required: true
-        type: choice
-        options: [ubuntu]
-        default: 'ubuntu'
       device_model:
         description: '设备型号'
         required: true
@@ -23,12 +17,38 @@ on:
         description: '内核版本'
         required: true
         default: '6.12.116'
+      distros:
+        description: '要构建的发行版（逗号分隔：ubuntu,debian,armbian）'
+        required: true
+        default: 'ubuntu,debian,armbian'
       ubuntu_version:
         description: 'Ubuntu Base 版本'
         required: false
         type: choice
         options: ['20.04.5', '22.04.5', '24.04.5']
         default: '22.04.5'
+      debian_suite:
+        description: 'Debian 代号'
+        required: false
+        type: choice
+        options: ['bookworm', 'trixie']
+        default: 'bookworm'
+      armbian_board:
+        description: 'Armbian 板型'
+        required: false
+        default: 'rock-5b'
+      armbian_release:
+        description: 'Armbian 发行代号'
+        required: false
+        type: choice
+        options: ['bookworm', 'trixie']
+        default: 'bookworm'
+      armbian_branch:
+        description: 'Armbian 分支'
+        required: false
+        type: choice
+        options: ['current', 'edge', 'vendor']
+        default: 'current'
       base_url:
         description: 'Ubuntu Base 下载根前缀'
         required: false
@@ -37,6 +57,10 @@ on:
         description: 'apt 软件源镜像'
         required: false
         default: 'http://repo.huaweicloud.com/ubuntu-ports'
+      debian_mirror:
+        description: 'Debian 软件源镜像'
+        required: false
+        default: 'https://mirrors.aliyun.com/debian'
       root_password:
         description: 'root 登录密码'
         required: false
@@ -52,7 +76,7 @@ on:
         options: ['no', 'yes']
         default: 'no'
       rootfs_size:
-        description: 'rootfs.img 最小大小（实际会按内容自动放大）'
+        description: 'rootfs.img 最小大小'
         required: true
         default: '2G'
 
@@ -60,17 +84,57 @@ permissions:
   contents: write
 
 jobs:
+  # ============================================================
+  # 准备矩阵：把 inputs.distros 拆成矩阵
+  # ============================================================
+  prepare-matrix:
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - id: set-matrix
+        run: |
+          set -euo pipefail
+          DISTROS="${{ inputs.distros }}"
+          MATRIX="[]"
+          IFS=',' read -ra ARR <<< "$DISTROS"
+          for d in "${ARR[@]}"; do
+            d=$(echo "$d" | xargs)
+            case "$d" in
+              ubuntu)  MATRIX=$(echo "$MATRIX" | jq -c '. + [{"distro":"ubuntu","codename":"${{ inputs.ubuntu_version }}","debian_suite":"bookworm","armbian_board":"rock-5b","armbian_release":"bookworm","armbian_branch":"current"}]') ;;
+              debian)  MATRIX=$(echo "$MATRIX" | jq -c '. + [{"distro":"debian","codename":"${{ inputs.debian_suite }}","debian_suite":"${{ inputs.debian_suite }}","armbian_board":"rock-5b","armbian_release":"bookworm","armbian_branch":"current"}]') ;;
+              armbian) MATRIX=$(echo "$MATRIX" | jq -c '. + [{"distro":"armbian","codename":"${{ inputs.armbian_release }}","debian_suite":"bookworm","armbian_board":"${{ inputs.armbian_board }}","armbian_release":"${{ inputs.armbian_release }}","armbian_branch":"${{ inputs.armbian_branch }}"}]') ;;
+              *) echo "⚠️ 未知 distro: $d";;
+            esac
+          done
+          echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
+          echo "矩阵: $MATRIX"
+
+  # ============================================================
+  # 构建矩阵
+  # ============================================================
   build-rockchip:
+    needs: prepare-matrix
     runs-on: ubuntu-22.04
     timeout-minutes: 240
+    strategy:
+      matrix:
+        include: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
+      fail-fast: false
+
     env:
-      DISTRO: ${{ inputs.distro }}
       DEVICE_MODEL: ${{ inputs.device_model }}
       BOARD: ${{ inputs.board }}
       KERNEL_VERSION: ${{ inputs.kernel_version }}
-      UBUNTU_VERSION: ${{ inputs.ubuntu_version }}
+      DISTRO: ${{ matrix.distro }}
+      CODENAME: ${{ matrix.codename }}
+      DEBIAN_SUITE: ${{ matrix.debian_suite }}
+      ARMBIAN_BOARD: ${{ matrix.armbian_board }}
+      ARMBIAN_RELEASE: ${{ matrix.armbian_release }}
+      ARMBIAN_BRANCH: ${{ matrix.armbian_branch }}
       BASE_URL: ${{ inputs.base_url }}
       MIRROR: ${{ inputs.mirror }}
+      DEBIAN_MIRROR: ${{ inputs.debian_mirror }}
       ROOT_PASSWORD: ${{ inputs.root_password }}
       CUSTOM_MAC: ${{ inputs.custom_mac }}
       MINIMAL_MODE: ${{ inputs.minimal_mode }}
@@ -81,14 +145,12 @@ jobs:
       uses: actions/checkout@v4
 
     # ============================================================
-    # 步骤 2：解析架构、CODENAME、UBUNTU_ARCH
-    # 修复：先本地赋值，再写 GITHUB_ENV（避免 set -u 下 unbound variable）
+    # 步骤 2：解析架构与 UBUNTU_ARCH（本地赋值 + GITHUB_ENV 双保险）
     # ============================================================
     - name: 2. 解析架构与工具链
       run: |
         set -euo pipefail
 
-        # ---- 先本地赋值（同一 step 内后续行可用）----
         ARCH=""
         CROSS_COMPILE=""
         KERNEL_IMAGE=""
@@ -112,28 +174,19 @@ jobs:
             ;;
         esac
 
-        CODENAME=""
-        case "${UBUNTU_VERSION}" in
-          20.04.*) CODENAME="focal" ;;
-          22.04.*) CODENAME="jammy" ;;
-          24.04.*) CODENAME="noble" ;;
-          *) echo "❌ 未知 UBUNTU_VERSION: ${UBUNTU_VERSION}"; exit 1 ;;
-        esac
-
-        # ---- 写 GITHUB_ENV（下一步生效）----
+        # CODENAME 已在 env 里（matrix.codename），无需再解析
         {
           echo "ARCH=${ARCH}"
           echo "CROSS_COMPILE=${CROSS_COMPILE}"
           echo "KERNEL_IMAGE=${KERNEL_IMAGE}"
           echo "UBUNTU_ARCH=${UBUNTU_ARCH}"
           echo "QEMU_STATIC=${QEMU_STATIC}"
-          echo "CODENAME=${CODENAME}"
         } >> "$GITHUB_ENV"
 
-        echo "✅ ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} UBUNTU_ARCH=${UBUNTU_ARCH} CODENAME=${CODENAME}"
+        echo "✅ DISTRO=${DISTRO} ARCH=${ARCH} UBUNTU_ARCH=${UBUNTU_ARCH} CODENAME=${CODENAME}"
 
     # ============================================================
-    # 步骤 3：安装依赖
+    # 步骤 3：安装依赖（含 mmdebstrap / losetup / rsync / xz-utils）
     # ============================================================
     - name: 3. 安装编译与打包依赖
       run: |
@@ -142,20 +195,23 @@ jobs:
         sudo apt-get install -y -qq \
           build-essential flex bison libssl-dev libelf-dev bc rsync \
           qemu-user-static e2fsprogs zip xz-utils kpartx android-sdk-libsparse-utils \
-          gcc-arm-linux-gnueabihf libc6-i386 \
-          device-tree-compiler
+          gcc-arm-linux-gnueabihf libc6-i386 device-tree-compiler \
+          mmdebstrap binfmt-support jq
 
     # ============================================================
-    # 步骤 4：缓存 rootfs
+    # 步骤 4：缓存 rootfs（key 含 distro + codename）
     # ============================================================
     - name: 4. 缓存 rootfs
       uses: actions/cache@v4
       with:
         path: cache/*
-        key: rootfs-${{ env.DISTRO }}-${{ env.UBUNTU_VERSION }}-${{ env.UBUNTU_ARCH }}
+        key: rootfs-${{ matrix.distro }}-${{ matrix.codename }}-${{ env.UBUNTU_ARCH }}
+        restore-keys: |
+          rootfs-${{ matrix.distro }}-${{ matrix.codename }}-
+          rootfs-${{ matrix.distro }}-
 
     # ============================================================
-    # 步骤 5：构建纯净 rootfs（完全交给 lib/common.sh）
+    # 步骤 5：构建纯净 rootfs（common.sh 三路分发）
     # ============================================================
     - name: 5. 构建纯净 rootfs
       run: |
@@ -163,10 +219,17 @@ jobs:
         export MODE=usb
         export ROOTFS_DIR="$PWD/usb_pure_rootfs"
         export TARGET_HOSTNAME="${DEVICE_MODEL}"
-        export UBUNTU_VERSION="${UBUNTU_VERSION}"
+        export DISTRO="${DISTRO}"
+        export UBUNTU_VERSION="${CODENAME}"
         export UBUNTU_ARCH="${UBUNTU_ARCH}"
         export UBUNTU_CODENAME="${CODENAME}"
-        export BASE_URL="https://cdimage.ubuntu.com/ubuntu-base/releases/${CODENAME}/release"
+        export DEBIAN_SUITE="${DEBIAN_SUITE}"
+        export DEBIAN_MIRROR="${DEBIAN_MIRROR}"
+        export DEBIAN_ARCH="${UBUNTU_ARCH}"
+        export ARMBIAN_BOARD="${ARMBIAN_BOARD}"
+        export ARMBIAN_RELEASE="${ARMBIAN_RELEASE}"
+        export ARMBIAN_BRANCH="${ARMBIAN_BRANCH}"
+        export BASE_URL="${BASE_URL}"
         export MIRROR="${MIRROR}"
         export MINIMAL_MODE="${MINIMAL_MODE}"
         export ROOT_PASSWORD="${ROOT_PASSWORD}"
@@ -186,24 +249,14 @@ jobs:
         tar xf "${KERNEL_TARBALL}"
         cd "linux-${KERNEL_VERSION}"
 
-        # defconfig
         cp "$GITHUB_WORKSPACE/configs/rk3188_defconfig" "arch/${ARCH}/configs/rk3188_defconfig"
         make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" rk3188_defconfig
 
-        # 6.12 关键符号
         for sym in \
-          CONFIG_OF_EARLY_FLATTREE \
-          CONFIG_DEVTMPFS \
-          CONFIG_BLK_DEV_INITRD \
-          CONFIG_ARM_APPENDED_DTB \
-          CONFIG_ARM_ATAG_DTB_COMPAT \
-          CONFIG_SERIAL_EARLYCON \
-          CONFIG_PARTITION_ADVANCED \
-          CONFIG_CMDLINE_PARTITION \
-          CONFIG_MMC_DW_ROCKCHIP \
-          CONFIG_EXT4_FS \
-          CONFIG_EXT4_FS_POSIX_ACL \
-          CONFIG_DW_WATCHDOG ; do
+          CONFIG_OF_EARLY_FLATTREE CONFIG_DEVTMPFS CONFIG_BLK_DEV_INITRD \
+          CONFIG_ARM_APPENDED_DTB CONFIG_ARM_ATAG_DTB_COMPAT CONFIG_SERIAL_EARLYCON \
+          CONFIG_PARTITION_ADVANCED CONFIG_CMDLINE_PARTITION \
+          CONFIG_MMC_DW_ROCKCHIP CONFIG_EXT4_FS CONFIG_EXT4_FS_POSIX_ACL CONFIG_DW_WATCHDOG ; do
           scripts/config --enable "$sym"
         done
         scripts/config --enable  CONFIG_ARM_ATAG_DTB_COMPAT_CMDLINE_FROM_BOOTLOADER
@@ -211,17 +264,12 @@ jobs:
 
         make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" olddefconfig
 
-        # 校验关键符号
         echo "===== 关键符号校验 ====="
-        for sym in \
-          CONFIG_PARTITION_ADVANCED \
-          CONFIG_MMC_DW_ROCKCHIP \
-          CONFIG_EXT4_FS ; do
+        for sym in CONFIG_PARTITION_ADVANCED CONFIG_MMC_DW_ROCKCHIP CONFIG_EXT4_FS; do
           grep -q "^${sym}=y" .config || { echo "❌ ${sym} 未启用"; exit 1; }
           echo "  ✅ ${sym}=y"
         done
 
-        # 编译 zImage + dtb + modules
         mkdir -p "arch/${ARCH}/boot/dts/rockchip"
         cp "$GITHUB_WORKSPACE/dts/"*.dts "arch/${ARCH}/boot/dts/rockchip/"
 
@@ -230,12 +278,10 @@ jobs:
         make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" -j"$(nproc)" modules
         make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" -j"$(nproc)" "rockchip/${BOARD}.dtb"
 
-        # 模块装进 rootfs + depmod
         sudo make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" \
           INSTALL_MOD_PATH="$GITHUB_WORKSPACE/usb_pure_rootfs" modules_install
         sudo chroot "$GITHUB_WORKSPACE/usb_pure_rootfs" /bin/bash -c 'depmod -a 2>/dev/null || true' || true
 
-        # 收集产物
         mkdir -p "$GITHUB_WORKSPACE/dtb_out"
         find "arch/${ARCH}/boot/dts" -name "*.dtb" -exec cp {} "$GITHUB_WORKSPACE/dtb_out/" \;
         cp "arch/${ARCH}/boot/${KERNEL_IMAGE}" "$GITHUB_WORKSPACE/${KERNEL_IMAGE}"
@@ -244,15 +290,14 @@ jobs:
         echo "✅ 内核与 dtb 编译完成"
 
     # ============================================================
-    # 步骤 7：打包刷机镜像（路线 A：mmcblk1p1 + mtdparts）
+    # 步骤 7：打包刷机镜像
     # ============================================================
     - name: 7. 打包刷机镜像
       run: |
         set -euo pipefail
-        FINAL_DIR="rk-flash-${DEVICE_MODEL}-Ubuntu_${UBUNTU_VERSION}-K${KERNEL_VERSION}"
+        FINAL_DIR="rk-flash-${DEVICE_MODEL}-${DISTRO}-${CODENAME}-K${KERNEL_VERSION}"
         mkdir -p "$FINAL_DIR"
 
-        # ---- rootfs.img ----
         ROOTFS_MB=$(sudo du -sm usb_pure_rootfs | cut -f1)
         IMG_MB=$(( ROOTFS_MB * 130 / 100 ))
         [ "$IMG_MB" -lt 2048 ] && IMG_MB=2048
@@ -269,16 +314,13 @@ jobs:
         e2fsck -p -f "$FINAL_DIR/rootfs.img" || true
         echo "✅ rootfs.img: $(stat -c%s "$FINAL_DIR/rootfs.img") 字节"
 
-        # ---- DTB ----
         mkdir -p "$FINAL_DIR/dtb"
         cp dtb_out/*.dtb "$FINAL_DIR/dtb/"
         DTB_FILE="dtb_out/${BOARD}.dtb"
         test -f "$DTB_FILE" || { echo "❌ 找不到 $DTB_FILE"; exit 1; }
 
-        # ---- zImage + dtb ----
         cat "${KERNEL_IMAGE}" "$DTB_FILE" > zImage-dtb
 
-        # ---- mkbootimg（路线 A：mmcblk1p1，无 blkdevparts）----
         CMDLINE_BOOT="earlyprintk console=ttyS2,115200 root=/dev/mmcblk1p1 rootfstype=ext4 rw rootwait init=/sbin/init maxcpus=1"
         rm -rf mkbootimg-src
         git clone --depth 1 https://github.com/neo-technologies/rockchip-mkbootimg.git mkbootimg-src
@@ -289,22 +331,17 @@ jobs:
           -o "$FINAL_DIR/boot.img"
         echo "✅ boot.img: $(stat -c%s "$FINAL_DIR/boot.img") 字节"
 
-        # ---- 体检 ----
         if [ -f "$GITHUB_WORKSPACE/inspect_rk_img.sh" ]; then
           chmod +x "$GITHUB_WORKSPACE/inspect_rk_img.sh"
           "$GITHUB_WORKSPACE/inspect_rk_img.sh" "$FINAL_DIR/boot.img" \
             | tee "$FINAL_DIR/boot-inspect.txt"
         fi
 
-        # ---- parameter.txt ----
         cp "$GITHUB_WORKSPACE/parameter.txt" "$FINAL_DIR/parameter.txt"
 
-        # ---- wipe-emmc.sh ----
         cat > "$FINAL_DIR/wipe-emmc.sh" << 'EOF'
         #!/bin/bash
         # 刷机前擦除 eMMC 前 1MiB（MBR + 原厂 Android 分区表）
-        # 解决：mmcblk1p1 只有 2MiB 导致挂根 panic
-        # 用法：TTL 串口登录后执行，然后重启用 RKDevTool "升级固件" 刷机
         set -e
         DEV=/dev/mmcblk1
         echo "⚠️  即将擦除 $DEV 前 1MiB，按 Ctrl+C 取消"
@@ -315,10 +352,10 @@ jobs:
         EOF
         chmod +x "$FINAL_DIR/wipe-emmc.sh"
 
-        # ---- README ----
         cat > "$FINAL_DIR/README.txt" << EOF
         设备: ${DEVICE_MODEL}  板型: ${BOARD}
-        内核: ${KERNEL_VERSION}  根文件系统: Ubuntu ${UBUNTU_VERSION} ${UBUNTU_ARCH}
+        发行版: ${DISTRO} (${CODENAME})
+        内核: ${KERNEL_VERSION}  架构: ${UBUNTU_ARCH}
 
         ========== 刷机步骤 ==========
         1. 【必做】擦除 eMMC 旧分区表：
@@ -333,7 +370,6 @@ jobs:
         4. 串口 ttyS2 / 115200 查看启动日志
 
         ========== 验证成功标志 ==========
-        日志里应出现：
           Kernel command line: ... root=/dev/mmcblk1p1 ...
           mmcblk1p1: ... 3.5 GiB   （不是 2MiB！）
           EXT4-fs (mmcblk1p1): mounted filesystem
@@ -341,7 +377,6 @@ jobs:
 
         ========== 账号 ==========
         root 密码: ${ROOT_PASSWORD}
-        首次登录后请立即 passwd root 修改
         EOF
 
         ZIP_NAME="${FINAL_DIR}.zip"
@@ -356,8 +391,8 @@ jobs:
     - name: 8. 上传到 Releases
       uses: softprops/action-gh-release@v2
       with:
-        tag_name: build-${{ github.run_number }}-${{ inputs.device_model }}
-        name: "RK3188 Ubuntu ${UBUNTU_VERSION} (Kernel ${KERNEL_VERSION}) - ${BOARD}"
+        tag_name: build-${{ github.run_number }}-${{ matrix.distro }}-${{ matrix.codename }}
+        name: "RK3188 ${{ matrix.distro }} ${{ matrix.codename }} (Kernel ${{ inputs.kernel_version }}) - ${{ inputs.board }}"
         files: |
           ${{ env.ZIP_NAME }}
       env:
