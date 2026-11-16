@@ -7,4 +7,78 @@ ATAG:0x60000800
 MACHINE:3066
 CHECK_MASK:0x80
 KERNEL_IMG:0x60408000
-CMDLINE:earlyprintk console=ttyS2,115200 root=/dev/mmcblk1p1 rootfstype=ext4 rw rootwait init=/sbin/init initrd=0x62000000,0x00800000 maxcpus=1 blkdevparts=mmcblk1:-@20M(rootfs) mtdparts=rk29xxnand:0x00008000@0x00002000(boot),-@0x0000A000(rootfs) dwc_driver=2
+
+# =====================================================================
+# parameter.txt — RK3188 aDesk-STD-200H-s / Linux 6.12（第八版）
+#
+#   [7] 【本轮唯一实质改动】rootfs 起点 20MiB → 24MiB
+#       —— 被 ttl-rz8 的救援 init 实测抓出来的。
+#
+#       救援 init 逐个偏移读 ext4 超级块，结果：
+#         20971520 (= 20 MiB) : magic=0000   没有 ext4
+#         25165824 (= 24 MiB) : ext4 ✅ 卷标=[rootfs]   ← 真正的 rootfs 在这里
+#         41943040 (= 40 MiB) : magic=0000
+#         ...
+#       并且 20MiB 处前 64 字节是 "41 4e 44 52 4f 49 44 21" = "ANDROID!"
+#       → 那里躺着的是一个 boot.img 头，不是 rootfs。
+#
+#       也就是说：RKDevTool 实际把 rootfs.img 写到了 24MiB（= 0xC000 扇区），
+#       而不是 parameter 里写的 0xA000（20MiB）。前七轮一直"分区对、root 对、
+#       ext4 内建，却 No filesystem could mount root, tried: ext4"，根因就是
+#       这 4MiB 的错位 —— 内核去 20MiB 找，数据在 24MiB。
+#
+#       为什么是 24MiB：20MiB 不是 8MiB 对齐点，24MiB 是 20MiB 之后最近的
+#       8MiB 边界。RK 的烧写工具会按分区粒度对齐写入位置。既然实测落在
+#       24MiB，就让内核和 mtdparts 都按 24MiB 来，两边重新对齐。
+#
+#       这次改动涉及三处，必须同时改，否则又是错位：
+#         blkdevparts  rootfs @ 24M          （内核建 /dev/mmcblk1p1 的起点）
+#         mtdparts     rootfs @ 0x0000C000   （工具烧写的起点，0xC000×512=24MiB）
+#         dts bootargs 同 CMDLINE            （loader 不覆盖时的兜底）
+#
+#       若以后工具又变（例如换成 0xA000 再烧一次 rootfs），不用再改这里：
+#       boot.img 里的救援 init 会自己扫盘找到 ext4 并挂载启动。
+# =====================================================================
+#
+# =====================================================================
+# 以下为历史改动记录（第五～七版，仍然有效）
+# =====================================================================
+#
+#   [1] CMDLINE 增加 blkdevparts（内核侧造分区）
+#       老 RK3188 SDK（Boot ver 2013-12-27#2.10）按 parameter 的绝对扇区裸写
+#       镜像，从来不写 MBR/GPT；扇区 0 就是 loader 本体。所以内核永远扫不到
+#       分区表，必须用 blkdevparts 自己造：
+#         blkdevparts=<磁盘名>:<size>[@<offset>](<名字>)
+#         size 为 "-" 表示剩余全部；单位字节，支持 K/M/G；内核内部 >>9 转扇区。
+#       本方案只建 rootfs 一个分区 → 它是 p1。
+#
+#   [2] root= 保持 /dev/mmcblk1p1（与 blkdevparts 建出的分区号严格对应）
+#       本方案故意不建 boot 分区：loader 用绝对扇区读 boot.img，内核不需要它。
+#
+#   [3] 不要擦 eMMC 前 1MiB：那里是 loader 本体，擦了盒子就进不了 loader。
+#
+#   [4] mtdparts=rk29xxnand:0x00008000@0x00002000(boot),-@0x0000C000(rootfs)
+#       mtdparts 是给 RKDevTool/loader 的烧写布局，blkdevparts 是给内核的分区，
+#       两者偏移必须一致：0x2000×512=4MiB(boot)，0xC000×512=24MiB(rootfs)。
+#       0x8000×512=16MiB 是 boot 分区长度。
+#
+#   [5] initrd=0x62000000,0x00800000 必须保留
+#       RK31 loader 只有看到这一项，才会把 boot.img 里的 ramdisk 搬到
+#       0x62000000 并交给内核（原厂 parameter-bibl.txt 里就有）。
+#       少了它，内核不会 unpack initramfs，救援 init 等于白打（ttl-rz7 实证）。
+#       地址与 mkbootimg 的 --ramdiskaddr 0x62000000 一致。
+#
+#   [6] dwc_driver=2：老 BSP 的 USB 参数，6.12 忽略；日志里出现
+#       "Unknown kernel command line parameters" 属正常现象。
+#
+#   前置条件（CI 强制校验，缺一项直接失败）：
+#     CONFIG_PARTITION_ADVANCED=y
+#     CONFIG_CMDLINE_PARTITION=y
+#
+#   刷机后 TTL 日志应出现（验证标志）：
+#     Kernel command line: ... blkdevparts=mmcblk1:-@24M(rootfs) ...
+#     mmcblk1: p1
+#     EXT4-fs (mmcblk1p1): mounted filesystem with ordered data mode
+#     Run /sbin/init as init process
+# =====================================================================
+CMDLINE:earlyprintk console=ttyS2,115200 root=/dev/mmcblk1p1 rootfstype=ext4 rw rootwait init=/sbin/init initrd=0x62000000,0x00800000 maxcpus=1 blkdevparts=mmcblk1:-@24M(rootfs) mtdparts=rk29xxnand:0x00008000@0x00002000(boot),-@0x0000C000(rootfs) dwc_driver=2
