@@ -395,7 +395,10 @@ jobs:
         # eMMC 靠这条别名才固定是 mmc1 → /dev/mmcblk1。
         # 一旦有人把 mmc0 改回 okay（或删掉 mmc1 别名），eMMC 可能变成 mmcblk0，
         # 刷机后就是 "Cannot open root device /dev/mmcblk1p1"，白白烧一次 eMMC。
-        python3 "$GITHUB_WORKSPACE/dts/${BOARD}.dts" << 'PY'
+        # 注意这行的 "-"：它告诉 python 从 stdin 读脚本，dts 路径是 argv[1]。
+        # 少了这个 "-"，python 会把 .dts 当成 python 脚本执行，报
+        #   SyntaxError: invalid character '（' (U+FF08)  ← 注释里的全角括号
+        python3 - "$GITHUB_WORKSPACE/dts/${BOARD}.dts" << 'PY'
         import re, sys
         src = open(sys.argv[1], encoding='utf-8').read()
 
