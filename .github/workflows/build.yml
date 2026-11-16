@@ -413,6 +413,43 @@ jobs:
         e2fsck -p -f "$FINAL_DIR/rootfs.img" || true
         echo "✅ rootfs.img: $(stat -c%s "$FINAL_DIR/rootfs.img") 字节"
 
+        # ========================================================
+        # 【修改点 E1】rootfs.img 有效性自检（第六轮新增）
+        #
+        # 第六轮实机日志（ttl-rz5）已经证明分区没问题：
+        #   mmcblk1: p1(rootfs)            ← 分区建出来了
+        #   b301 3846144 mmcblk1p1         ← 大小对（20MiB~盘尾）
+        # 但紧接着：
+        #   No filesystem could mount root, tried: ext4
+        #   Kernel panic ... "/dev/mmcblk1p1" or unknown-block(179,1)
+        # 这句和上一轮不是一回事：设备节点存在、ext4 已内建，是"这个分区里
+        # 没有 ext4 超级块"。只有两种可能，必须分开：
+        #   a) 产物里的 rootfs.img 本身坏了/没打进去  ← 本段自检在 CI 阶段就拦
+        #   b) 镜像没问题，但刷机时 rootfs 那一行根本没写进 eMMC 的 0xA000
+        #      （勾选漏了 / 文件路径还是旧的 / 用"升级固件"页只写了 loader）
+        # ext4 关键位置：超级块在文件偏移 1024，s_magic 在 +0x38（0x53EF），
+        # s_volume_name 在 +0x78（应为 rootfs）。
+        # ========================================================
+        python3 - "$FINAL_DIR/rootfs.img" << 'PY'
+        import os, sys
+        path = sys.argv[1]
+        with open(path, 'rb') as f:
+            head = f.read(2048)
+        magic = head[1024 + 0x38:1024 + 0x38 + 2]
+        label = head[1024 + 0x78:1024 + 0x78 + 16].rstrip(b'\x00').decode('utf-8', 'replace')
+        size_mb = os.path.getsize(path) / 1048576
+        print('rootfs.img 大小      : %.1f MiB' % size_mb)
+        print('rootfs.img ext4 魔数 : %s（应为 53ef）' % magic.hex())
+        print('rootfs.img 卷标      : %r（应为 rootfs）' % label)
+        assert magic == b'\x53\xef', 'rootfs.img 0x400+0x38 处不是 ext4 超级块（0x53EF）'
+        assert label == 'rootfs', 'rootfs.img 卷标不是 rootfs（/etc/fstab 用 LABEL=rootfs 会挂错）'
+        assert size_mb >= 2048, 'rootfs.img 小于 2GiB，刷进去装不下系统'
+        print('✅ rootfs.img 自检通过：是有效 ext4、卷标 rootfs、大小 %.0f MiB' % size_mb)
+        PY
+        echo "---- ext4 头信息（对照刷机后 blkid 应该一致）----"
+        dumpe2fs -h "$FINAL_DIR/rootfs.img" 2>/dev/null \
+          | grep -E "Filesystem volume name|Block count|Free blocks|Block size|Filesystem features" || true
+
         mkdir -p "$FINAL_DIR/dtb"
         cp dtb_out/*.dtb "$FINAL_DIR/dtb/"
         DTB_FILE="dtb_out/${BOARD}.dtb"
@@ -509,17 +546,26 @@ jobs:
         内核: ${KERNEL_VERSION}  架构: ${UBUNTU_ARCH}
 
         ========== 刷机步骤 ==========
-        1. RKDevTool 用 "升级固件" 模式（不是 "下载镜像"）：
-           - Loader      ：原厂 loader（或本包未附带时留空，用设备里现有的）
-           - Parameter   ：【必须手动选本目录的 parameter.txt】
-                           ⚠️ 不要用原厂 parameter-bibl.txt，也不要让工具沿用旧路径，
-                             否则 CMDLINE 里没有 blkdevparts，内核找不到 rootfs 必 panic。
-           - boot.img    ：本目录的 boot.img
-           - rootfs.img  ：本目录的 rootfs.img
-        2. 点击 "执行"，等待完成
+        1. RKDevTool 用 "下载镜像" 页（Download Image），不是 "升级固件" 页。
+           "升级固件" 吃的是单个 update.img，本包给的是分立的 4 个文件，
+           在那个页面上你选了也不会真的把 rootfs.img 写进 eMMC。
+           四行必须全部【打勾】，地址与文件严格对应：
+             #1 Loader     0x00000000   loader.bin（原厂，本包未附带则用现有的）
+             #2 Parameter  0x00000000   本目录的 parameter.txt
+             #3 boot       0x00002000   本目录的 boot.img      （= 4 MiB）
+             #4 rootfs     0x0000A000   本目录的 rootfs.img    （= 20 MiB）
+        2. 点击 "执行"。rootfs.img 有 2GiB，rootfs 那一行会走几分钟；
+           如果整个刷机几秒钟就结束，说明 rootfs 根本没写下去 —— 这就是
+           第六轮 "No filesystem could mount root, tried: ext4" 的原因。
         3. 串口 ttyS2 / 115200 查看启动日志（本机 TTL 物理接 UART2）
         4. 【无需】再擦 eMMC 分区表：eMMC 本来就没有分区表，
            rootfs 分区由内核按 CMDLINE 的 blkdevparts 现场创建。
+
+        ========== 刷机前先核对镜像指纹 ==========
+          MANIFEST.sha256 里有 parameter.txt / boot.img / rootfs.img 的 SHA256。
+          rootfs.img 下载被截断 = 刷进去没有 ext4 超级块，症状和前几轮一模一样。
+            Linux  : sha256sum -c MANIFEST.sha256
+            Windows: certutil -hashfile rootfs.img SHA256
 
         ========== 验证成功标志（按顺序出现）==========
           Kernel command line: ... blkdevparts=mmcblk1:-@20M(rootfs) ...
@@ -534,14 +580,27 @@ jobs:
           B. 日志里有 blkdevparts 但没有 "mmcblk1: p1"
              → 打开本包 kernel.config，确认 CONFIG_CMDLINE_PARTITION=y；
                这一版 CI 已强制校验，正常不会缺。
-          C. 有 p1 但仍 panic
-             → 看 p1 大小是否等于 3.6GB 左右；若 p1 只有 2MiB，
-               说明 root= 指到了 eMMC 的硬件 boot 分区（mmcblk1boot1），
-               与本包无关。
+          C. 有 p1、但报 "No filesystem could mount root, tried: ext4"
+             → 分区对了，是 p1 起点（20MiB）没有 ext4 超级块：
+               要么 rootfs.img 没写进 0x0000A000（查勾选/地址/耗时/指纹），
+               要么刷的是别的包里的旧 rootfs.img。
+          D. 有 p1、且能看到 EXT4-fs，但卡在 init
+             → 才轮到 rootfs 内部（systemd/getty）问题，届时再发日志。
 
         ========== 账号 ==========
         root 密码: ${ROOT_PASSWORD}
         EOF
+
+        # ========================================================
+        # 【修改点 E2】产物指纹清单
+        # rootfs.img 有 2GiB，下载过程一旦被截断，刷进去就是“没有 ext4 超级块”
+        # 这种最费时间的假故障。这里生成 MANIFEST.sha256，刷机前先核对：
+        #   Windows: certutil -hashfile rootfs.img SHA256
+        #   Linux  : sha256sum -c MANIFEST.sha256
+        # 指纹一致 → 镜像没坏，问题一定在“刷机时 rootfs 那行有没有真的写下去”。
+        # ========================================================
+        ( cd "$FINAL_DIR" && sha256sum parameter.txt boot.img rootfs.img > MANIFEST.sha256 \
+          && echo "---- MANIFEST.sha256 ----" && cat MANIFEST.sha256 )
 
         ZIP_NAME="${FINAL_DIR}.zip"
         cd "$FINAL_DIR"
