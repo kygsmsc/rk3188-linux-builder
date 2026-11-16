@@ -495,31 +495,169 @@ jobs:
         rm -rf mkbootimg-src
         git clone --depth 1 https://github.com/neo-technologies/rockchip-mkbootimg.git mkbootimg-src
         make -C mkbootimg-src
+
+        # ========================================================
+        # 【修改点 F】给 boot.img 塞一个"救援 initramfs"（第七轮新增）
+        #
+        # 前六轮日志都停在同一个位置，且是同一个含义：
+        #   mmcblk1: p1(rootfs)       /  b301 3846144 mmcblk1p1   ← 分区完全正确
+        #   No filesystem could mount root, tried: ext4
+        #   Kernel panic ... "/dev/mmcblk1p1" or unknown-block(179,1)
+        # 设备节点存在、ext4 已内建，却读不到超级块。内核到此为止再没有任何
+        # 能力告诉我们"eMMC 20MiB 那段里到底写着什么"。只能让内核先跑我们
+        # 自己的 /init：
+        #   1) 打印 /proc/partitions 和设备节点；
+        #   2) 在多个候选偏移读 ext4 超级块（起始 +1024，magic 0x53EF）并打卷标；
+        #   3) 把 20MiB 处前 64 字节原样 dump —— 全 00 = 没写；504b = 写成 zip；
+        #      其它 = 别的东西，一眼定性；
+        #   4) 找到 ext4 就挂载并 switch_root 继续正常启动（偏移不是 20MiB 也能起）。
+        # 老 RK3188 loader 本来就必须支持 ramdisk（原厂 Android boot.img 就带），
+        # ramdisk 地址对齐原厂的 0x62000000。
+        # ========================================================
+        sudo chroot "$GITHUB_WORKSPACE/usb_pure_rootfs" /bin/bash -c \
+          'apt-get install -y --no-install-recommends busybox-static >/dev/null 2>&1 || true'
+        if [ ! -f "$GITHUB_WORKSPACE/usb_pure_rootfs/bin/busybox" ]; then
+          echo "❌ rootfs 里没有 /bin/busybox（busybox-static 装不上），无法生成救援 initramfs"
+          exit 1
+        fi
+
+        IR="$GITHUB_WORKSPACE/rescue_initramfs"
+        rm -rf "$IR"
+        mkdir -p "$IR/bin" "$IR/proc" "$IR/sys" "$IR/dev" "$IR/newroot"
+        sudo cp "$GITHUB_WORKSPACE/usb_pure_rootfs/bin/busybox" "$IR/bin/busybox"
+        sudo chmod 755 "$IR/bin/busybox"
+        sudo tee "$IR/init" > /dev/null <<'INIT_EOF'
+        #!/bin/busybox sh
+        /bin/busybox --install -s /bin 2>/dev/null
+        export PATH=/bin:/sbin
+
+        mount -t proc none /proc 2>/dev/null
+        mount -t sysfs none /sys 2>/dev/null
+        mount -t devtmpfs none /dev 2>/dev/null
+
+        log() { echo "[rescue] $*"; }
+        MB=1048576
+        DISK=/dev/mmcblk1
+
+        log "================ RK3188 救援 initramfs ================"
+        log "这一段是 CI 打进 boot.img 的 /init，用来查 eMMC 里到底有什么"
+        log "---- /proc/partitions ----"
+        cat /proc/partitions
+        log "---- 设备节点 ----"
+        ls -l /dev/mmcblk1 /dev/mmcblk1p1 2>/dev/null
+
+        if [ ! -b "$DISK" ]; then
+          log "❌ 没有 $DISK（MMC 驱动没起来，与 rootfs 无关）"
+          exec sh
+        fi
+
+        # ext4 超级块固定在分区起始 +1024，magic 两字节在 +0x38
+        magic_at() {
+          dd if=$DISK bs=512 skip=$(( $1 / 512 + 2 )) count=1 2>/dev/null \
+            | od -An -tx1 -N 58 | tr -s ' ' '\n' | grep -v '^$' | tail -2 | tr -d '\n'
+        }
+        label_at() {
+          dd if=$DISK bs=8 skip=$(( ( $1 + 1144 ) / 8 )) count=2 2>/dev/null \
+            | tr -d '\000' | tr -d '\n'
+        }
+
+        log "---- 候选偏移探测（ext4 超级块 magic 应为 53ef）----"
+        FOUND=""
+        for off in 20971520 41943040 25165824 29360128 33554432 16777216 8388608 67108864 134217728 268435456 0; do
+          m=$(magic_at $off)
+          if [ "$m" = "53ef" ]; then
+            log "  $off 字节 (= $(( off / MB )) MiB) : ext4 ✅ 卷标=[$(label_at $off)]"
+            [ -z "$FOUND" ] && FOUND=$off
+          else
+            log "  $off 字节 (= $(( off / MB )) MiB) : 无 ext4 (magic=$m)"
+          fi
+        done
+
+        log "---- eMMC 20MiB 处原始前 64 字节（全 00=没写，504b=写成了zip，其它=旧数据）----"
+        dd if=$DISK bs=512 skip=40960 count=1 2>/dev/null | od -An -tx1 -N 64
+
+        if [ -z "$FOUND" ]; then
+          log "❌ 所有候选偏移都没有 ext4 超级块 → rootfs.img 没有真正刷进 eMMC"
+          log "   请把这段日志发出来；同时核对刷机工具里 rootfs 行的 勾选/文件/地址/耗时"
+          exec sh
+        fi
+
+        log "✅ 在 $FOUND 字节 (= $(( FOUND / MB )) MiB) 找到 ext4，开始挂载"
+        if [ "$FOUND" = "20971520" ]; then
+          mount -t ext4 -o rw /dev/mmcblk1p1 /newroot
+        else
+          if ! mount -t ext4 -o rw,loop,offset=$FOUND $DISK /newroot 2>/dev/null; then
+            losetup -o $FOUND /dev/loop0 $DISK 2>/dev/null
+            mount -t ext4 -o rw /dev/loop0 /newroot
+          fi
+        fi
+
+        if [ ! -e /newroot/sbin/init ]; then
+          log "❌ 挂上了，但没有 /sbin/init（镜像内容不完整）"
+          exec sh
+        fi
+
+        log "✅ rootfs 已挂载，switch_root 到真实 /sbin/init"
+        mount -t proc none /newroot/proc 2>/dev/null
+        mount -t sysfs none /newroot/sys 2>/dev/null
+        mount -t devtmpfs none /newroot/dev 2>/dev/null
+        exec switch_root /newroot /sbin/init
+        INIT_EOF
+        sudo chmod 755 "$IR/init"
+
+        ( cd "$IR" && sudo find . -print0 | sudo cpio --null -o -H newc --quiet | gzip -9 ) \
+          > "$FINAL_DIR/initramfs.cpio.gz"
+        echo "✅ initramfs.cpio.gz: $(stat -c%s "$FINAL_DIR/initramfs.cpio.gz") 字节"
+        gzip -t "$FINAL_DIR/initramfs.cpio.gz" || { echo "❌ initramfs 压缩包损坏"; exit 1; }
+        gzip -dc "$FINAL_DIR/initramfs.cpio.gz" | cpio -it 2>/dev/null | grep -qx './init' \
+          || { echo "❌ initramfs 里没有 /init"; exit 1; }
+
+        ./mkbootimg-src/mkbootimg \
+          --kernel zImage-dtb \
+          --ramdisk "$FINAL_DIR/initramfs.cpio.gz" \
+          --ramdiskaddr 0x62000000 \
+          --cmdline "$CMDLINE_BOOT" \
+          -o "$FINAL_DIR/boot.img"
+        echo "✅ boot.img（含救援 initramfs）: $(stat -c%s "$FINAL_DIR/boot.img") 字节"
+
+        # 保险件：万一老 loader 对 ramdisk 不感冒，连 "Starting kernel" 都不打，
+        # 就用这个纯内核版 boot-nord.img 回退（行为与前六轮完全一致）。
         ./mkbootimg-src/mkbootimg \
           --kernel zImage-dtb \
           --cmdline "$CMDLINE_BOOT" \
-          -o "$FINAL_DIR/boot.img"
-        echo "✅ boot.img: $(stat -c%s "$FINAL_DIR/boot.img") 字节"
+          -o "$FINAL_DIR/boot-nord.img"
+        echo "✅ boot-nord.img（无 ramdisk，回退用）: $(stat -c%s "$FINAL_DIR/boot-nord.img") 字节"
 
         # ========================================================
-        # 【修改点 D3】回读 boot.img 头里的 cmdline 做二次确认
-        # 标准 Android boot image：magic "ANDROID!"，page_size 16384（RK3188），
-        # cmdline 在第二个 512 字节槽（文件偏移 0x40），ramdisk_size 必须为 0。
+        # 【修改点 D3】回读 boot.img 头做二次确认
+        # 标准 Android boot image：magic "ANDROID!"，page_size 16384（RK3188）。
+        # 第七轮起 ramdisk 里带救援 init，所以 ramdisk_size 不再为 0，
+        # 同时要确认 ramdisk_addr 是原厂的 0x62000000、kernel 仍是 0x60408000。
         # ========================================================
-        python3 - "$FINAL_DIR/boot.img" << 'PY'
-        import sys
-        path = sys.argv[1]
-        with open(path, 'rb') as f:
-            head = f.read(16384)
-        assert head[:8] == b'ANDROID!', 'boot.img 头不是 ANDROID!（打包格式错误）'
-        cmd = head[0x40:0x40 + 512].split(b'\0')[0].decode('utf-8', 'replace')
-        ramdisk_size = int.from_bytes(head[0x10:0x14], 'little')
-        print('boot.img 头 cmdline :', cmd)
-        print('boot.img ramdisk_size:', ramdisk_size)
-        for token in ('blkdevparts=mmcblk1:', 'root=/dev/mmcblk1p1', 'console=ttyS2'):
-            assert token in cmd, 'boot.img 头 cmdline 缺少: ' + token
-        assert ramdisk_size == 0, 'ramdisk_size 应为 0（本项目无 initramfs）'
-        print('✅ boot.img 头校验通过（含 blkdevparts、root=/dev/mmcblk1p1、无 ramdisk）')
+        python3 - "$FINAL_DIR/boot.img" "$FINAL_DIR/boot-nord.img" << 'PY'
+        import sys, struct
+        for path, expect_ramdisk in ((sys.argv[1], True), (sys.argv[2], False)):
+            with open(path, 'rb') as f:
+                head = f.read(16384)
+            assert head[:8] == b'ANDROID!', path + ' 头不是 ANDROID!（打包格式错误）'
+            ksize, kaddr, rsize, raddr = struct.unpack('<4I', head[0x08:0x18])
+            page = struct.unpack('<I', head[0x24:0x28])[0]
+            cmd = head[0x40:0x40 + 512].split(b'\0')[0].decode('utf-8', 'replace')
+            print('----', path.split('/')[-1], '----')
+            print('  cmdline      :', cmd)
+            print('  kernel_addr  : 0x%08x  kernel_size: %d' % (kaddr, ksize))
+            print('  ramdisk_addr : 0x%08x  ramdisk_size: %d' % (raddr, rsize))
+            print('  page_size    :', page)
+            for token in ('blkdevparts=mmcblk1:', 'root=/dev/mmcblk1p1', 'console=ttyS2'):
+                assert token in cmd, path + ' 头 cmdline 缺少: ' + token
+            assert kaddr == 0x60408000, path + ' kernel_addr 应为 0x60408000'
+            assert page == 16384, path + ' page_size 应为 16384'
+            if expect_ramdisk:
+                assert rsize > 0, 'boot.img 里没有 ramdisk（救援 init 没打进去）'
+                assert raddr == 0x62000000, 'boot.img ramdisk_addr 应为 0x62000000'
+            else:
+                assert rsize == 0, 'boot-nord.img 不应该带 ramdisk'
+        print('✅ 两个 boot 镜像头校验通过（boot.img 带救援 ramdisk，boot-nord.img 纯净）')
         PY
 
         if [ -f "$GITHUB_WORKSPACE/inspect_rk_img.sh" ]; then
@@ -562,10 +700,26 @@ jobs:
            rootfs 分区由内核按 CMDLINE 的 blkdevparts 现场创建。
 
         ========== 刷机前先核对镜像指纹 ==========
-          MANIFEST.sha256 里有 parameter.txt / boot.img / rootfs.img 的 SHA256。
-          rootfs.img 下载被截断 = 刷进去没有 ext4 超级块，症状和前几轮一模一样。
+          MANIFEST.sha256 里有 parameter.txt / boot.img / boot-nord.img / rootfs.img
+          的 SHA256。rootfs.img 下载被截断 = 刷进去没有 ext4 超级块，症状和前几轮
+          一模一样。
             Linux  : sha256sum -c MANIFEST.sha256
             Windows: certutil -hashfile rootfs.img SHA256
+
+        ========== 第七轮的变化：boot.img 里带了"救援 init"==========
+          刷 boot.img（0x00002000）之后，串口会先打印一段以 [rescue] 开头的信息：
+            - 候选偏移逐个报告有没有 ext4 超级块（20MiB / 40MiB / 24MiB / 32MiB ...）
+            - 打印 eMMC 20MiB 处原始前 64 字节
+              · 全是 00           → rootfs.img 根本没写进去
+              · 开头是 504b 0304  → rootfs 那行选的文件其实是 zip，选错文件了
+              · 开头是 53ef ...   → 数据在，是偏移/分区起点对不上
+          三种情况日志会直接给出结论，不用再猜。
+          若第 3 行出现 "✅ 在 xxx 找到 ext4"，则会自动挂载并 switch_root，
+          继续正常启动（偏移不是 20MiB 也能起来）。
+
+          ⚠️ 如果刷了 boot.img 后连 "Starting kernel..." 都不打印（老 loader 不认
+             ramdisk），把 #3 boot 那行的文件换成 boot-nord.img（行为等同前六轮），
+             把串口日志发出来即可。
 
         ========== 验证成功标志（按顺序出现）==========
           Kernel command line: ... blkdevparts=mmcblk1:-@20M(rootfs) ...
@@ -599,7 +753,7 @@ jobs:
         #   Linux  : sha256sum -c MANIFEST.sha256
         # 指纹一致 → 镜像没坏，问题一定在“刷机时 rootfs 那行有没有真的写下去”。
         # ========================================================
-        ( cd "$FINAL_DIR" && sha256sum parameter.txt boot.img rootfs.img > MANIFEST.sha256 \
+        ( cd "$FINAL_DIR" && sha256sum parameter.txt boot.img boot-nord.img rootfs.img > MANIFEST.sha256 \
           && echo "---- MANIFEST.sha256 ----" && cat MANIFEST.sha256 )
 
         ZIP_NAME="${FINAL_DIR}.zip"
