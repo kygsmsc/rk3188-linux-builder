@@ -399,8 +399,12 @@ jobs:
 
         ROOTFS_MB=$(sudo du -sm usb_pure_rootfs | cut -f1)
         IMG_MB=$(( ROOTFS_MB * 130 / 100 ))
-        [ "$IMG_MB" -lt 2048 ] && IMG_MB=2048
-        echo "rootfs 实际 ${ROOTFS_MB}MB，镜像 ${IMG_MB}MB"
+        # 【修改点 F3】镜像下限从 2048MB 降到 1024MB。
+        # 实测 rootfs 实际只有 289MB，做 2GiB 镜像纯属浪费：每次刷机要多写 1GiB，
+        # 刷写时间翻倍、中途被打断/工具写不完的概率也翻倍（这正是这几轮反复怀疑
+        # "rootfs 没写进去" 的根源）。1024MB 对 289MB 的内容仍有 3.5 倍余量。
+        [ "$IMG_MB" -lt 1024 ] && IMG_MB=1024
+        echo "rootfs 实际 ${ROOTFS_MB}MB，镜像 ${IMG_MB}MB（下限 1024MB）"
 
         truncate -s "${IMG_MB}M" "$FINAL_DIR/rootfs.img"
         mkfs.ext4 -F -L rootfs "$FINAL_DIR/rootfs.img"
@@ -443,7 +447,7 @@ jobs:
         print('rootfs.img 卷标      : %r（应为 rootfs）' % label)
         assert magic == b'\x53\xef', 'rootfs.img 0x400+0x38 处不是 ext4 超级块（0x53EF）'
         assert label == 'rootfs', 'rootfs.img 卷标不是 rootfs（/etc/fstab 用 LABEL=rootfs 会挂错）'
-        assert size_mb >= 2048, 'rootfs.img 小于 2GiB，刷进去装不下系统'
+        assert size_mb >= 1024, 'rootfs.img 小于 1GiB，刷进去装不下系统（下限见 F3）'
         print('✅ rootfs.img 自检通过：是有效 ext4、卷标 rootfs、大小 %.0f MiB' % size_mb)
         PY
         echo "---- ext4 头信息（对照刷机后 blkid 应该一致）----"
@@ -605,12 +609,18 @@ jobs:
         INIT_EOF
         sudo chmod 755 "$IR/init"
 
-        ( cd "$IR" && sudo find . -print0 | sudo cpio --null -o -H newc --quiet | gzip -9 ) \
-          > "$FINAL_DIR/initramfs.cpio.gz"
+        # 【修改点 F2】不再依赖 cpio 命令
+        # 上一轮 CI 就死在这一步：`gzip -dc ... | cpio -it | grep -qx './init'`
+        # 报 "❌ initramfs 里没有 /init"，可归档明明有 868606 字节（内容是在的），
+        # 是不同 cpio 版本下 `-t` 的列表输出/退出码形态不一致导致的误判。
+        # 改为调用仓库里的 tools/mkinitramfs.py：自己写 newc 归档、自己回读校验，
+        # 不依赖 runner 上装没装 cpio。
+        MKI="$GITHUB_WORKSPACE/tools/mkinitramfs.py"
+        [ -f "$MKI" ] || MKI="$GITHUB_WORKSPACE/mkinitramfs.py"
+        [ -f "$MKI" ] || { echo "❌ 仓库里找不到 tools/mkinitramfs.py"; exit 1; }
+        python3 "$MKI" --create "$IR" "$FINAL_DIR/initramfs.cpio.gz"
         echo "✅ initramfs.cpio.gz: $(stat -c%s "$FINAL_DIR/initramfs.cpio.gz") 字节"
-        gzip -t "$FINAL_DIR/initramfs.cpio.gz" || { echo "❌ initramfs 压缩包损坏"; exit 1; }
-        gzip -dc "$FINAL_DIR/initramfs.cpio.gz" | cpio -it 2>/dev/null | grep -qx './init' \
-          || { echo "❌ initramfs 里没有 /init"; exit 1; }
+        python3 "$MKI" --verify "$FINAL_DIR/initramfs.cpio.gz" /init /bin/busybox
 
         ./mkbootimg-src/mkbootimg \
           --kernel zImage-dtb \
@@ -692,7 +702,8 @@ jobs:
              #2 Parameter  0x00000000   本目录的 parameter.txt
              #3 boot       0x00002000   本目录的 boot.img      （= 4 MiB）
              #4 rootfs     0x0000A000   本目录的 rootfs.img    （= 20 MiB）
-        2. 点击 "执行"。rootfs.img 有 2GiB，rootfs 那一行会走几分钟；
+        2. 点击 "执行"。rootfs.img 约 1GiB（内容 289MB，下限 1024MB），
+           rootfs 那一行会走 1~3 分钟；
            如果整个刷机几秒钟就结束，说明 rootfs 根本没写下去 —— 这就是
            第六轮 "No filesystem could mount root, tried: ext4" 的原因。
         3. 串口 ttyS2 / 115200 查看启动日志（本机 TTL 物理接 UART2）
@@ -747,7 +758,7 @@ jobs:
 
         # ========================================================
         # 【修改点 E2】产物指纹清单
-        # rootfs.img 有 2GiB，下载过程一旦被截断，刷进去就是“没有 ext4 超级块”
+        # rootfs.img 约 1GiB，下载过程一旦被截断，刷进去就是“没有 ext4 超级块”
         # 这种最费时间的假故障。这里生成 MANIFEST.sha256，刷机前先核对：
         #   Windows: certutil -hashfile rootfs.img SHA256
         #   Linux  : sha256sum -c MANIFEST.sha256
