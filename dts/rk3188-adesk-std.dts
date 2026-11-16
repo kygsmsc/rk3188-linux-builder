@@ -20,9 +20,34 @@
 	};
 
 	chosen {
-		/* 修正：console/stdout 对齐物理串口 UART2（ttyS2）；原 serial0/uart0 是误改 */
+		/* 修正：console/stdout 对齐物理串口 UART2（ttyS2）；原 serial0/uart0 是误改
+		 *
+		 * 【第五轮 DTS 改动 2/2：bootargs 与 parameter.txt 的 CMDLINE 完全对齐】
+		 * 原代码：
+		 *   bootargs = "console=ttyS2,115200 earlyprintk loglevel=8";
+		 * 只带 console，没有 root= / blkdevparts。
+		 *
+		 * 为什么要在 DT 里也写一份？
+		 *   内核配置里有 CONFIG_ARM_ATAG_DTB_COMPAT_CMDLINE_FROM_BOOTLOADER=y，
+		 *   正常路径是 loader 把 parameter.txt 的 CMDLINE 通过 ATAG 传进来并覆盖
+		 *   这里的 bootargs（所以上一轮日志里的 CMDLINE 一直等于 parameter 内容）。
+		 *   但一旦 loader 没传 ATAG（换 loader / 换刷机模式 / parameter 没被选中），
+		 *   内核就会退回到吃这里的 bootargs —— 没有 root= 和 blkdevparts 时
+		 *   又必然 panic。这里写同一份完整串，等于给内核留一条备用路径。
+		 *   两处内容必须一字不差地保持同步（build.yml 已从 parameter.txt 里读取
+		 *   CMDLINE 直接写进 boot.img 头，CI 还会比对，防止两边漂移）。
+		 *
+		 * blkdevparts=mmcblk1:-@20M(rootfs)：
+		 *   eMMC 上没有 MBR/GPT（上一轮日志 unknown-block(179,1) 已证明），
+		 *   由内核 block/partitions/cmdline.c 按命令行建分区：
+		 *   在 mmcblk1 上、从 20MiB 起、到盘尾，建 1 个名为 rootfs 的分区，
+		 *   即 /dev/mmcblk1p1。生效前提是 CONFIG_PARTITION_ADVANCED=y +
+		 *   CONFIG_CMDLINE_PARTITION=y（build.yml 编译期已强制校验）。
+		 *   注意 "-" 是“剩余全部”，单位字节；20M 与 mtdparts 里 rootfs 的
+		 *   0xA000 扇区（×512=20MiB）严格对应，不能改一个不改另一个。
+		 */
 		stdout-path = "serial2:115200n8";
-		bootargs = "console=ttyS2,115200 earlyprintk loglevel=8";
+		bootargs = "console=ttyS2,115200 earlyprintk root=/dev/mmcblk1p1 rootfstype=ext4 rw rootwait init=/sbin/init maxcpus=1 blkdevparts=mmcblk1:-@20M(rootfs)";
 	};
 
 	memory@60000000 {
