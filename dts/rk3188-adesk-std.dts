@@ -47,7 +47,16 @@
 		 *   0xA000 扇区（×512=20MiB）严格对应，不能改一个不改另一个。
 		 */
 		stdout-path = "serial2:115200n8";
-		bootargs = "console=ttyS2,115200 earlyprintk root=/dev/mmcblk1p1 rootfstype=ext4 rw rootwait init=/sbin/init maxcpus=1 blkdevparts=mmcblk1:-@20M(rootfs)";
+		// 【第七轮改动：bootargs 补 initrd=0x62000000,0x00800000，与 parameter.txt 的 CMDLINE 逐字对齐】
+		// 原因：ttl-rz7 里 boot.img 头带了 ramdisk（头校验 ramdisk_addr=0x62000000、
+		// ramdisk_size>0），但内核完全没有 unpack initramfs 的动作，直接进 mount_root
+		// 然后 panic —— 说明 loader 没把 ramdisk 交给内核。原厂 parameter-bibl.txt 的
+		// CMDLINE 里正是有 initrd=0x62000000,0x00800000，它是 RK31 loader "把 ramdisk
+		// 搬到 0x62000000" 的指令。loader 会用自己的 CMDLINE 覆盖这里（ATAG_FROM_
+		// BOOTLOADER），所以两边必须同步；平时以 parameter.txt 为准。
+		// 原值（保留备查）：
+		// bootargs = "console=ttyS2,115200 earlyprintk root=/dev/mmcblk1p1 rootfstype=ext4 rw rootwait init=/sbin/init maxcpus=1 blkdevparts=mmcblk1:-@20M(rootfs)";
+		bootargs = "console=ttyS2,115200 earlyprintk root=/dev/mmcblk1p1 rootfstype=ext4 rw rootwait init=/sbin/init initrd=0x62000000,0x00800000 maxcpus=1 blkdevparts=mmcblk1:-@20M(rootfs)";
 	};
 
 	memory@60000000 {
