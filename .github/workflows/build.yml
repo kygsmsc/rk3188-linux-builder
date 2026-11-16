@@ -485,7 +485,26 @@ jobs:
           *blkdevparts=mmcblk1:*\(rootfs\)*)
             echo "  ✅ CMDLINE 含 blkdevparts=mmcblk1:... (rootfs)" ;;
           *)
-            echo "❌ parameter.txt 的 CMDLINE 缺少 blkdevparts=mmcblk1:-@20M(rootfs)"
+            echo "❌ parameter.txt 的 CMDLINE 缺少 blkdevparts=mmcblk1:-@24M(rootfs)"
+            exit 1 ;;
+        esac
+        # 【第八轮】ttl-rz8 实测：工具把 rootfs.img 写到了 24MiB，不是 20MiB。
+        # 内核 blkdevparts 与工具 mtdparts 必须指向同一个起点，这里硬校验两个数：
+        #   blkdevparts ... @24M      （字节单位）
+        #   mtdparts    ... @0x0000C000(rootfs)   （扇区单位，0xC000×512=24MiB）
+        # 任何一处漏改，恢复出来的就是前七轮那种 "分区对、ext4 却读不到"。
+        case "${CMDLINE_BOOT}" in
+          *blkdevparts=mmcblk1:-@24M\(rootfs\)*)
+            echo "  ✅ blkdevparts rootfs 起点 = 24MiB" ;;
+          *)
+            echo "❌ blkdevparts 起点必须是与 mtdparts 一致的 24MiB（@24M）"
+            exit 1 ;;
+        esac
+        case "${CMDLINE_BOOT}" in
+          *\-@0x0000C000\(rootfs\)*)
+            echo "  ✅ mtdparts rootfs 起点 = 0x0000C000（24MiB，与 blkdevparts 对齐）" ;;
+          *)
+            echo "❌ mtdparts 的 rootfs 起点必须写成 -@0x0000C000(rootfs)（24MiB）"
             exit 1 ;;
         esac
         case "${CMDLINE_BOOT}" in
@@ -623,19 +642,34 @@ jobs:
         fi
 
         log "✅ 在 $FOUND 字节 (= $(( FOUND / MB )) MiB) 找到 ext4，开始挂载"
-        if [ "$FOUND" = "20971520" ]; then
+
+        # 【第八轮修正 1】如果找到的起点正好等于内核建出的 p1 起点，就直接挂 p1，
+        # 不绕 loop（loop 那一路在 busybox 下会把 offset 当 ext4 挂载参数传给内核，
+        # ttl-rz8 里就出现了 "ext4: Unknown parameter 'offset'"）。
+        P1_START_SECT=$(cat /sys/class/block/mmcblk1p1/start 2>/dev/null)
+        if [ "$P1_START_SECT" = "$(( FOUND / 512 ))" ]; then
+          log "  起点与 mmcblk1p1 一致（p1 start=$P1_START_SECT 扇区），直接挂 /dev/mmcblk1p1"
           mount -t ext4 -o rw /dev/mmcblk1p1 /newroot
         else
-          if ! mount -t ext4 -o rw,loop,offset=$FOUND $DISK /newroot 2>/dev/null; then
-            losetup -o $FOUND /dev/loop0 $DISK 2>/dev/null
-            mount -t ext4 -o rw /dev/loop0 /newroot
-          fi
+          log "  起点与 p1 不一致（p1 start=$P1_START_SECT 扇区），用 loop 挂"
+          losetup -d /dev/loop0 2>/dev/null
+          losetup -o $FOUND /dev/loop0 $DISK 2>/dev/null \
+            && mount -t ext4 -o rw /dev/loop0 /newroot \
+            || mount -t ext4 -o rw,loop,offset=$FOUND $DISK /newroot 2>/dev/null
         fi
 
-        if [ ! -e /newroot/sbin/init ]; then
-          log "❌ 挂上了，但没有 /sbin/init（镜像内容不完整）"
+        # 【第八轮修正 2】原检查 `[ -e /newroot/sbin/init ]` 在 Ubuntu 上是误判：
+        # /sbin 是指向 /usr/sbin 的绝对软链，未 chroot 时内核按 initramfs 的 / 解析，
+        # 必然找不到 → ttl-rz8 报 "没有 /sbin/init"，其实 rootfs 是好的。
+        # 改成检查不带软链的实体文件。
+        if [ ! -e /newroot/etc/os-release ] && [ ! -e /newroot/usr/lib/systemd/systemd ]; then
+          log "❌ 挂上了，但看不到 /etc/os-release 和 /usr/lib/systemd/systemd —— 镜像内容不完整"
+          log "   （若两者都在，说明是真 rootfs；这里顺带列一下根目录：）"
+          ls -l /newroot | head -20
           exec sh
         fi
+        log "  rootfs 内容确认：$(cat /newroot/etc/os-release 2>/dev/null | head -1)"
+        df -h /newroot 2>/dev/null | tail -2
 
         log "✅ rootfs 已挂载，switch_root 到真实 /sbin/init"
         mount -t proc none /newroot/proc 2>/dev/null
@@ -737,7 +771,7 @@ jobs:
              #1 Loader     0x00000000   loader.bin（原厂，本包未附带则用现有的）
              #2 Parameter  0x00000000   本目录的 parameter.txt
              #3 boot       0x00002000   本目录的 boot.img      （= 4 MiB）
-             #4 rootfs     0x0000A000   本目录的 rootfs.img    （= 20 MiB）
+             #4 rootfs     0x0000C000   本目录的 rootfs.img    （= 24 MiB）
         2. 点击 "执行"。rootfs.img 约 1GiB（内容 289MB，下限 1024MB），
            rootfs 那一行会走 1~3 分钟；
            如果整个刷机几秒钟就结束，说明 rootfs 根本没写下去 —— 这就是
@@ -753,20 +787,38 @@ jobs:
             Linux  : sha256sum -c MANIFEST.sha256
             Windows: certutil -hashfile rootfs.img SHA256
 
-        ========== 第八轮的变化：Parameter 里补了 initrd=，救援 init 才会真正跑 ==========
-          ttl-rz7 现象：boot.img 头里明明带了 ramdisk（ramdisk_addr=0x62000000、
-          ramdisk_size>0），内核却完全没有 unpack initramfs 的动作，直接去 mount root
-          然后 panic。原因找到了：RK31 loader 只有在 CMDLINE 里看到
+        ========== ★ 本轮真正的修复：rootfs 起点 20MiB → 24MiB ★ ==========
+          ttl-rz8 里救援 init 逐个偏移扫 ext4 超级块，结果是：
+              20 MiB（0x0000A000）→ magic=0000，没有 ext4
+              24 MiB（0x0000C000）→ ext4，卷标 [rootfs]   ← 真正的 rootfs 在这里
+          而且 20MiB 处前 64 字节是 "ANDROID!"（一个残留的 boot.img 头）。
+          也就是说：RKDevTool 实际把 rootfs.img 写到了 24MiB，不是 parameter 里
+          写的 0xA000。前七轮"分区对了、root 也对了、ext4 却读不到"的真正原因
+          就是这 4MiB 错位 —— 内核去 20MiB 找，数据在 24MiB。
+          （20MiB 不是 8MiB 对齐点，24MiB 是它之后最近的 8MiB 边界，RK 工具按
+           分区粒度对齐写入。）
+
+          本包已经把三处统一到 24MiB：
+              parameter.txt : blkdevparts=mmcblk1:-@24M(rootfs)
+                              mtdparts=...,-@0x0000C000(rootfs)
+              dts bootargs  : 同上
+              CI 校验       : 两处偏移不一致直接失败
+          所以你按本包 parameter + boot 刷，本包以后的 rootfs 也烧到 24MiB，
+          两边永远对齐。
+
+        ========== 第八轮（仍有效）：Parameter 里的 initrd= 不能删 ==========
+          RK31 loader 只有看到 CMDLINE 里的
               initrd=0x62000000,0x00800000
-          时才会把 boot.img 里的 ramdisk 搬到 0x62000000 并把它交给内核。
-          原厂 parameter-bibl.txt 的 CMDLINE 里就有这一项，是我们前几版删掉的。
-          本包 parameter.txt 已补回，地址与 mkbootimg 的 --ramdiskaddr 一致。
+          才会把 boot.img 里的 ramdisk 搬到 0x62000000 交给内核；删掉它，
+          救援 init = 白打（ttl-rz7 实证：boot.img 带 ramdisk，内核却不 unpack）。
+          原厂 parameter-bibl.txt 里本来就有这一项。
 
         ========== 这一次请先只刷这两行（快，10MB 级）==========
-          #2 Parameter  0x00000000   parameter.txt   ← 必须换成本包的（多了 initrd=）
+          #2 Parameter  0x00000000   parameter.txt   ← 必须换成本包的（@24M）
           #3 boot       0x00002000   boot.img        ← 带救援 init 的那份
-          rootfs 不用重刷（1GiB 写入太慢，这次改动没碰它内容）。
-          确认启动日志里出现 [rescue] 后，再按它的结论决定下一步。
+          rootfs **不要**重刷：盘上 24MiB 那份就是这份 rootfs.img（救援 init 已
+          实测挂上、卷标 [rootfs]、内容 288.8MB 与 CI 打印的 289MB 吻合）。
+          刷完看日志：出现 "Run /sbin/init as init process" 就进系统了。
 
         ========== 救援 init 会打印什么 ==========
             - /proc/cmdline（核对 initrd= 有没有真的传进来）
@@ -783,7 +835,7 @@ jobs:
              如果这次还是看不到 [rescue]，请先确认 #3 那行选的是 boot.img（带 ramdisk 的）。
 
         ========== 验证成功标志（按顺序出现）==========
-          Kernel command line: ... blkdevparts=mmcblk1:-@20M(rootfs) ...
+          Kernel command line: ... blkdevparts=mmcblk1:-@24M(rootfs) ...
           mmcblk1: p1
           EXT4-fs (mmcblk1p1): mounted filesystem with ordered data mode
           Run /sbin/init as init process
@@ -796,9 +848,10 @@ jobs:
              → 打开本包 kernel.config，确认 CONFIG_CMDLINE_PARTITION=y；
                这一版 CI 已强制校验，正常不会缺。
           C. 有 p1、但报 "No filesystem could mount root, tried: ext4"
-             → 分区对了，是 p1 起点（20MiB）没有 ext4 超级块：
-               要么 rootfs.img 没写进 0x0000A000（查勾选/地址/耗时/指纹），
-               要么刷的是别的包里的旧 rootfs.img。
+             → 分区起点和真实数据错开了。先看 [rescue] 的
+               "候选偏移探测" 那一行：哪个偏移报了 ext4 / 卷标=[rootfs]，
+               就把 parameter.txt 的 blkdevparts @NN M 与 mtdparts
+               -@0x........(rootfs) 都改成那个位置，重刷 Parameter 即可。
           D. 有 p1、且能看到 EXT4-fs，但卡在 init
              → 才轮到 rootfs 内部（systemd/getty）问题，届时再发日志。
 
