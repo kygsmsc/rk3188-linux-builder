@@ -37,14 +37,21 @@
 		 *   两处内容必须一字不差地保持同步（build.yml 已从 parameter.txt 里读取
 		 *   CMDLINE 直接写进 boot.img 头，CI 还会比对，防止两边漂移）。
 		 *
-		 * blkdevparts=mmcblk1:-@20M(rootfs)：
+		 * blkdevparts=mmcblk1:-@24M(rootfs)：
 		 *   eMMC 上没有 MBR/GPT（上一轮日志 unknown-block(179,1) 已证明），
 		 *   由内核 block/partitions/cmdline.c 按命令行建分区：
-		 *   在 mmcblk1 上、从 20MiB 起、到盘尾，建 1 个名为 rootfs 的分区，
+		 *   在 mmcblk1 上、从 24MiB 起、到盘尾，建 1 个名为 rootfs 的分区，
 		 *   即 /dev/mmcblk1p1。生效前提是 CONFIG_PARTITION_ADVANCED=y +
 		 *   CONFIG_CMDLINE_PARTITION=y（build.yml 编译期已强制校验）。
-		 *   注意 "-" 是“剩余全部”，单位字节；20M 与 mtdparts 里 rootfs 的
-		 *   0xA000 扇区（×512=20MiB）严格对应，不能改一个不改另一个。
+		 *   注意 "-" 是“剩余全部”，单位字节；24M 必须与 parameter.txt 里
+		 *   mtdparts 的 rootfs 起点 0x0000C000 扇区（×512=24MiB）严格对应。
+		 *
+		 *   【第八轮：20M → 24M】ttl-rz8 的救援 init 逐偏移读 ext4 超级块，
+		 *   只有 24MiB（25165824）命中（卷标 rootfs），20MiB 处前 64 字节是
+		 *   "ANDROID!"（残留 boot.img 头）。即 RKDevTool 实际把 rootfs.img 写在
+		 *   24MiB，而非 parameter 写的 0xA000。前七轮 "No filesystem could mount
+		 *   root, tried: ext4" 就是这个 4MiB 错位。改起点为 24MiB 后，
+		 *   blkdevparts / mtdparts / bootargs 三处已同步（CI 有一致性硬校验）。
 		 */
 		stdout-path = "serial2:115200n8";
 		// 【第七轮改动：bootargs 补 initrd=0x62000000,0x00800000，与 parameter.txt 的 CMDLINE 逐字对齐】
@@ -54,9 +61,9 @@
 		// CMDLINE 里正是有 initrd=0x62000000,0x00800000，它是 RK31 loader "把 ramdisk
 		// 搬到 0x62000000" 的指令。loader 会用自己的 CMDLINE 覆盖这里（ATAG_FROM_
 		// BOOTLOADER），所以两边必须同步；平时以 parameter.txt 为准。
-		// 原值（保留备查）：
+		// 原值（保留备查；第七轮时的形态：无 initrd=，rootfs 起点 20M = 0xA000）：
 		// bootargs = "console=ttyS2,115200 earlyprintk root=/dev/mmcblk1p1 rootfstype=ext4 rw rootwait init=/sbin/init maxcpus=1 blkdevparts=mmcblk1:-@20M(rootfs)";
-		bootargs = "console=ttyS2,115200 earlyprintk root=/dev/mmcblk1p1 rootfstype=ext4 rw rootwait init=/sbin/init initrd=0x62000000,0x00800000 maxcpus=1 blkdevparts=mmcblk1:-@20M(rootfs)";
+		bootargs = "console=ttyS2,115200 earlyprintk root=/dev/mmcblk1p1 rootfstype=ext4 rw rootwait init=/sbin/init initrd=0x62000000,0x00800000 maxcpus=1 blkdevparts=mmcblk1:-@24M(rootfs)";
 	};
 
 	memory@60000000 {
