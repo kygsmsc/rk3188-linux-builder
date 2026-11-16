@@ -496,6 +496,19 @@ jobs:
             exit 1 ;;
         esac
 
+        # 【第七轮】loader 只有在 CMDLINE 里看到 initrd=<addr>,<size> 时才会把
+        # boot.img 里的 ramdisk 搬到该地址并传 ATAG；ttl-rz7 就是缺这一项，
+        # 所以内核完全没 unpack initramfs。缺它 = 救援 init 白打，直接判失败。
+        case "${CMDLINE_BOOT}" in
+          *initrd=0x62000000,*)
+            echo "  ✅ CMDLINE 含 initrd=0x62000000,...（loader 会搬 ramdisk）" ;;
+          *)
+            echo "❌ CMDLINE 缺少 initrd=0x62000000,0x00800000"
+            exit 1 ;;
+        esac
+        [ "${#CMDLINE_BOOT}" -le 500 ] \
+          || { echo "❌ CMDLINE ${#CMDLINE_BOOT} 字节，超过 boot.img 头 512 字节上限"; exit 1; }
+
         rm -rf mkbootimg-src
         git clone --depth 1 https://github.com/neo-technologies/rockchip-mkbootimg.git mkbootimg-src
         make -C mkbootimg-src
@@ -545,6 +558,8 @@ jobs:
 
         log "================ RK3188 救援 initramfs ================"
         log "这一段是 CI 打进 boot.img 的 /init，用来查 eMMC 里到底有什么"
+        log "---- /proc/cmdline ----"
+        cat /proc/cmdline
         log "---- /proc/partitions ----"
         cat /proc/partitions
         log "---- 设备节点 ----"
@@ -576,6 +591,27 @@ jobs:
             log "  $off 字节 (= $(( off / MB )) MiB) : 无 ext4 (magic=$m)"
           fi
         done
+
+        if [ -z "$FOUND" ]; then
+          log "---- 候选都没命中，开始粗扫（1MiB 步长扫 4~128MiB，8MiB 步长扫到盘尾）----"
+          off=4194304
+          while [ $off -lt 134217728 ]; do
+            if [ "$(magic_at $off)" = "53ef" ]; then
+              log "  ✅ $off 字节 (= $(( off / MB )) MiB) 有 ext4，卷标=[$(label_at $off)]"
+              [ -z "$FOUND" ] && FOUND=$off
+            fi
+            off=$(( off + 1048576 ))
+          done
+          off=134217728
+          while [ $off -lt 3866624000 ]; do
+            if [ "$(magic_at $off)" = "53ef" ]; then
+              log "  ✅ $off 字节 (= $(( off / MB )) MiB) 有 ext4，卷标=[$(label_at $off)]"
+              [ -z "$FOUND" ] && FOUND=$off
+            fi
+            off=$(( off + 8388608 ))
+          done
+          log "  粗扫结束"
+        fi
 
         log "---- eMMC 20MiB 处原始前 64 字节（全 00=没写，504b=写成了zip，其它=旧数据）----"
         dd if=$DISK bs=512 skip=40960 count=1 2>/dev/null | od -An -tx1 -N 64
@@ -717,20 +753,34 @@ jobs:
             Linux  : sha256sum -c MANIFEST.sha256
             Windows: certutil -hashfile rootfs.img SHA256
 
-        ========== 第七轮的变化：boot.img 里带了"救援 init"==========
-          刷 boot.img（0x00002000）之后，串口会先打印一段以 [rescue] 开头的信息：
+        ========== 第八轮的变化：Parameter 里补了 initrd=，救援 init 才会真正跑 ==========
+          ttl-rz7 现象：boot.img 头里明明带了 ramdisk（ramdisk_addr=0x62000000、
+          ramdisk_size>0），内核却完全没有 unpack initramfs 的动作，直接去 mount root
+          然后 panic。原因找到了：RK31 loader 只有在 CMDLINE 里看到
+              initrd=0x62000000,0x00800000
+          时才会把 boot.img 里的 ramdisk 搬到 0x62000000 并把它交给内核。
+          原厂 parameter-bibl.txt 的 CMDLINE 里就有这一项，是我们前几版删掉的。
+          本包 parameter.txt 已补回，地址与 mkbootimg 的 --ramdiskaddr 一致。
+
+        ========== 这一次请先只刷这两行（快，10MB 级）==========
+          #2 Parameter  0x00000000   parameter.txt   ← 必须换成本包的（多了 initrd=）
+          #3 boot       0x00002000   boot.img        ← 带救援 init 的那份
+          rootfs 不用重刷（1GiB 写入太慢，这次改动没碰它内容）。
+          确认启动日志里出现 [rescue] 后，再按它的结论决定下一步。
+
+        ========== 救援 init 会打印什么 ==========
+            - /proc/cmdline（核对 initrd= 有没有真的传进来）
             - 候选偏移逐个报告有没有 ext4 超级块（20MiB / 40MiB / 24MiB / 32MiB ...）
+            - 候选不中时自动粗扫：1MiB 步长扫 4~128MiB，8MiB 步长扫到盘尾
             - 打印 eMMC 20MiB 处原始前 64 字节
               · 全是 00           → rootfs.img 根本没写进去
               · 开头是 504b 0304  → rootfs 那行选的文件其实是 zip，选错文件了
               · 开头是 53ef ...   → 数据在，是偏移/分区起点对不上
-          三种情况日志会直接给出结论，不用再猜。
-          若第 3 行出现 "✅ 在 xxx 找到 ext4"，则会自动挂载并 switch_root，
-          继续正常启动（偏移不是 20MiB 也能起来）。
+          找到 ext4 就 mount + switch_root 继续启动（偏移不是 20MiB 也能起来）。
 
-          ⚠️ 如果刷了 boot.img 后连 "Starting kernel..." 都不打印（老 loader 不认
-             ramdisk），把 #3 boot 那行的文件换成 boot-nord.img（行为等同前六轮），
-             把串口日志发出来即可。
+          ⚠️ 只有"连 Starting kernel... 都不打印"时才用 boot-nord.img。
+             ttl-rz5/6/7 都打印了 Starting kernel，所以那几轮**不该**用 boot-nord.img；
+             如果这次还是看不到 [rescue]，请先确认 #3 那行选的是 boot.img（带 ramdisk 的）。
 
         ========== 验证成功标志（按顺序出现）==========
           Kernel command line: ... blkdevparts=mmcblk1:-@20M(rootfs) ...
