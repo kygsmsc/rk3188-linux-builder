@@ -306,6 +306,26 @@ jobs:
         cp "$GITHUB_WORKSPACE/configs/rk3188_defconfig" "arch/${ARCH}/configs/rk3188_defconfig"
         make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" rk3188_defconfig
 
+        # ========================================================
+        # 【修改点 C1】内核配置：命令行分区解析器必须真的编进内核
+        #
+        # 依据（6.12.116 源码，block/partitions/Kconfig）：
+        #   config PARTITION_ADVANCED
+        #       bool "Advanced partition selection"
+        #   config CMDLINE_PARTITION
+        #       bool "Command line partition support" if PARTITION_ADVANCED
+        #       help  "Say Y here if you want to read the partition table from bootargs."
+        #   config OF_PARTITION
+        #       bool "Device Tree partition support" if PARTITION_ADVANCED
+        # 且 block/partitions/Makefile 里只有 obj-$(CONFIG_CMDLINE_PARTITION) += cmdline.o。
+        #
+        # 参考配置 config-5.10.27-rk3188 第 728 行是
+        #   "# CONFIG_PARTITION_ADVANCED is not set"
+        # 它里面的老符号 CONFIG_BLK_CMDLINE_PARSER=y（5.10 叫 blkdevparts 的开关，
+        # 见 block/partitions/cmdline.c 的 __setup("blkdevparts=")）在 6.12 里已经
+        # 改名成 CONFIG_CMDLINE_PARTITION，olddefconfig 不会自动帮你迁移，
+        # 必须显式打开 —— 这就是 eMMC 上"没有 MBR 也没有分区"的根因所在。
+        # ========================================================
         for sym in \
           CONFIG_OF_EARLY_FLATTREE CONFIG_DEVTMPFS CONFIG_BLK_DEV_INITRD \
           CONFIG_ARM_APPENDED_DTB CONFIG_ARM_ATAG_DTB_COMPAT CONFIG_SERIAL_EARLYCON \
@@ -318,11 +338,32 @@ jobs:
 
         make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" olddefconfig
 
+        # ========================================================
+        # 【修改点 C2】兜底：不同版本的 scripts/config 在 .config 里找不到某个
+        # 符号时行为不一致（有的直接报错、有的静默跳过），这里再按文本强制写一遍，
+        # 然后重跑 olddefconfig 让依赖（PARTITION_ADVANCED → CMDLINE_PARTITION）
+        # 正确落盘。多这一步成本近乎为零，但能避免"编译成功、分区却没有"的黑盒。
+        # ========================================================
+        for sym in CONFIG_PARTITION_ADVANCED CONFIG_CMDLINE_PARTITION; do
+          sed -i "s/^# ${sym} is not set/${sym}=y/" .config
+          grep -q "^${sym}=y" .config || echo "${sym}=y" >> .config
+        done
+        make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" olddefconfig
+
         echo "===== 关键符号校验 ====="
-        for sym in CONFIG_PARTITION_ADVANCED CONFIG_MMC_DW_ROCKCHIP CONFIG_EXT4_FS; do
+        # ========================================================
+        # 【修改点 C3】上一版的校验只查了 CONFIG_PARTITION_ADVANCED，等于没查：
+        # 真正决定 blkdevparts 是否生效的是 CONFIG_CMDLINE_PARTITION。
+        # 这里把两个分区符号 + 启动链路必需符号一起校验，缺任何一个直接失败，
+        # 不产出"注定 panic"的刷机包。
+        # ========================================================
+        for sym in CONFIG_PARTITION_ADVANCED CONFIG_CMDLINE_PARTITION \
+                   CONFIG_MMC_DW_ROCKCHIP CONFIG_EXT4_FS CONFIG_DEVTMPFS \
+                   CONFIG_ARM_ATAG_DTB_COMPAT_CMDLINE_FROM_BOOTLOADER; do
           grep -q "^${sym}=y" .config || { echo "❌ ${sym} 未启用"; exit 1; }
           echo "  ✅ ${sym}=y"
         done
+        grep -E "CONFIG_(PARTITION_ADVANCED|CMDLINE_PARTITION)=" .config
 
         mkdir -p "arch/${ARCH}/boot/dts/rockchip"
         cp "$GITHUB_WORKSPACE/dts/"*.dts "arch/${ARCH}/boot/dts/rockchip/"
@@ -339,6 +380,10 @@ jobs:
         mkdir -p "$GITHUB_WORKSPACE/dtb_out"
         find "arch/${ARCH}/boot/dts" -name "*.dtb" -exec cp {} "$GITHUB_WORKSPACE/dtb_out/" \;
         cp "arch/${ARCH}/boot/${KERNEL_IMAGE}" "$GITHUB_WORKSPACE/${KERNEL_IMAGE}"
+
+        # 【修改点 C4】把编译出的 .config 带进产物，出问题可以第一现场核对
+        # （上一轮排查"分区解析器到底有没有编进去"就是缺少这份实物证据）
+        cp .config "$GITHUB_WORKSPACE/kernel.config"
 
         test -f "$GITHUB_WORKSPACE/dtb_out/${BOARD}.dtb" || { echo "❌ 找不到 ${BOARD}.dtb"; exit 1; }
         echo "✅ 内核与 dtb 编译完成"
@@ -375,7 +420,41 @@ jobs:
 
         cat "${KERNEL_IMAGE}" "$DTB_FILE" > zImage-dtb
 
-        CMDLINE_BOOT="earlyprintk console=ttyS2,115200 root=/dev/mmcblk1p1 rootfstype=ext4 rw rootwait init=/sbin/init maxcpus=1"
+        # ========================================================
+        # 【修改点 D1】cmdline 只保留一个来源：parameter.txt
+        #
+        # 上一版在 workflow 里又手写了一份 CMDLINE_BOOT（root=/dev/mmcblk1p1，
+        # 没有 blkdevparts），和 parameter.txt 里的 CMDLINE 是两处独立维护。
+        # 实测教训：loader 真正传给内核的是 parameter.txt 的 CMDLINE（日志里
+        # Kernel command line 与 parameter 一字不差，末尾还会被 loader 追加
+        # bootver/firmware_ver），boot.img 头里的 cmdline 只用于自检。
+        # 两处各写一份，改一处忘一处就出现"头里写了、实机没有"的假象。
+        # 现在直接抽取 parameter.txt 的 CMDLINE，两边永远一致。
+        # ========================================================
+        CMDLINE_BOOT=$(grep -m1 '^CMDLINE:' "$GITHUB_WORKSPACE/parameter.txt" \
+                       | sed -e 's/^CMDLINE:/ /' -e 's/^[[:space:]]*//')
+        echo "参数文件 cmdline: ${CMDLINE_BOOT}"
+
+        # ========================================================
+        # 【修改点 D2】硬性校验：没有 blkdevparts / root= 没对准 p1，直接失败。
+        # eMMC 上没有 MBR/GPT（ttl-rz4 日志 unknown-block(179,1) 已证明），
+        # 缺了 blkdevparts 就必然复制上一轮那次 panic，没必要白刷一次。
+        # ========================================================
+        case "${CMDLINE_BOOT}" in
+          *blkdevparts=mmcblk1:*\(rootfs\)*)
+            echo "  ✅ CMDLINE 含 blkdevparts=mmcblk1:... (rootfs)" ;;
+          *)
+            echo "❌ parameter.txt 的 CMDLINE 缺少 blkdevparts=mmcblk1:-@20M(rootfs)"
+            exit 1 ;;
+        esac
+        case "${CMDLINE_BOOT}" in
+          *root=/dev/mmcblk1p1*)
+            echo "  ✅ CMDLINE root=/dev/mmcblk1p1（与 blkdevparts 建出的 rootfs=p1 对应）" ;;
+          *)
+            echo "❌ root= 必须与 blkdevparts 建出的分区号一致（本方案 rootfs 是 p1）"
+            exit 1 ;;
+        esac
+
         rm -rf mkbootimg-src
         git clone --depth 1 https://github.com/neo-technologies/rockchip-mkbootimg.git mkbootimg-src
         make -C mkbootimg-src
@@ -385,6 +464,27 @@ jobs:
           -o "$FINAL_DIR/boot.img"
         echo "✅ boot.img: $(stat -c%s "$FINAL_DIR/boot.img") 字节"
 
+        # ========================================================
+        # 【修改点 D3】回读 boot.img 头里的 cmdline 做二次确认
+        # 标准 Android boot image：magic "ANDROID!"，page_size 16384（RK3188），
+        # cmdline 在第二个 512 字节槽（文件偏移 0x40），ramdisk_size 必须为 0。
+        # ========================================================
+        python3 - "$FINAL_DIR/boot.img" << 'PY'
+        import sys
+        path = sys.argv[1]
+        with open(path, 'rb') as f:
+            head = f.read(16384)
+        assert head[:8] == b'ANDROID!', 'boot.img 头不是 ANDROID!（打包格式错误）'
+        cmd = head[0x40:0x40 + 512].split(b'\0')[0].decode('utf-8', 'replace')
+        ramdisk_size = int.from_bytes(head[0x10:0x14], 'little')
+        print('boot.img 头 cmdline :', cmd)
+        print('boot.img ramdisk_size:', ramdisk_size)
+        for token in ('blkdevparts=mmcblk1:', 'root=/dev/mmcblk1p1', 'console=ttyS2'):
+            assert token in cmd, 'boot.img 头 cmdline 缺少: ' + token
+        assert ramdisk_size == 0, 'ramdisk_size 应为 0（本项目无 initramfs）'
+        print('✅ boot.img 头校验通过（含 blkdevparts、root=/dev/mmcblk1p1、无 ramdisk）')
+        PY
+
         if [ -f "$GITHUB_WORKSPACE/inspect_rk_img.sh" ]; then
           chmod +x "$GITHUB_WORKSPACE/inspect_rk_img.sh"
           "$GITHUB_WORKSPACE/inspect_rk_img.sh" "$FINAL_DIR/boot.img" \
@@ -392,19 +492,16 @@ jobs:
         fi
 
         cp "$GITHUB_WORKSPACE/parameter.txt" "$FINAL_DIR/parameter.txt"
+        cp "$GITHUB_WORKSPACE/kernel.config" "$FINAL_DIR/kernel.config"
 
-        cat > "$FINAL_DIR/wipe-emmc.sh" << 'EOF'
-        #!/bin/bash
-        # 刷机前擦除 eMMC 前 1MiB（MBR + 原厂 Android 分区表）
-        set -e
-        DEV=/dev/mmcblk1
-        echo "⚠️  即将擦除 $DEV 前 1MiB，按 Ctrl+C 取消"
-        sleep 3
-        dd if=/dev/zero of=$DEV bs=1M count=1 conv=fsync
-        sync
-        echo "✅ eMMC 前 1MiB 已擦除，现在重启并用 RKDevTool 升级固件"
-        EOF
-        chmod +x "$FINAL_DIR/wipe-emmc.sh"
+        # ========================================================
+        # 【修改点 D4】删除 wipe-emmc.sh
+        # 上一版让用户刷机前 dd 擦 eMMC 前 1MiB，理由写的是"擦掉旧 MBR 让 loader
+        # 重建分区表"。两处都是错的：
+        #   1) 前 1MiB 里是 loader 本体，擦掉可能直接让盒子进不了 loader；
+        #   2) loader 从来不会按 mtdparts 写 MBR，分区表根本不存在（日志实证）。
+        # 这个脚本只会制造风险，没有任何收益，整段删除。
+        # ========================================================
 
         cat > "$FINAL_DIR/README.txt" << EOF
         设备: ${DEVICE_MODEL}  板型: ${BOARD}
@@ -412,22 +509,35 @@ jobs:
         内核: ${KERNEL_VERSION}  架构: ${UBUNTU_ARCH}
 
         ========== 刷机步骤 ==========
-        1. 【必做】擦除 eMMC 旧分区表：
-           方式 A：TTL 串口登录现有系统，执行 wipe-emmc.sh
-           方式 B：RKDevTool → 高级功能 → 擦除 Flash → 全盘擦除
-        2. RKDevTool 用 "升级固件" 模式（不是 "下载镜像"）：
-           - loader（原厂）
-           - parameter.txt
-           - boot.img
-           - rootfs.img
-        3. 点击 "执行"，等待完成
-        4. 串口 ttyS2 / 115200 查看启动日志
+        1. RKDevTool 用 "升级固件" 模式（不是 "下载镜像"）：
+           - Loader      ：原厂 loader（或本包未附带时留空，用设备里现有的）
+           - Parameter   ：【必须手动选本目录的 parameter.txt】
+                           ⚠️ 不要用原厂 parameter-bibl.txt，也不要让工具沿用旧路径，
+                             否则 CMDLINE 里没有 blkdevparts，内核找不到 rootfs 必 panic。
+           - boot.img    ：本目录的 boot.img
+           - rootfs.img  ：本目录的 rootfs.img
+        2. 点击 "执行"，等待完成
+        3. 串口 ttyS2 / 115200 查看启动日志（本机 TTL 物理接 UART2）
+        4. 【无需】再擦 eMMC 分区表：eMMC 本来就没有分区表，
+           rootfs 分区由内核按 CMDLINE 的 blkdevparts 现场创建。
 
-        ========== 验证成功标志 ==========
-          Kernel command line: ... root=/dev/mmcblk1p1 ...
-          mmcblk1p1: ... 3.5 GiB   （不是 2MiB！）
-          EXT4-fs (mmcblk1p1): mounted filesystem
+        ========== 验证成功标志（按顺序出现）==========
+          Kernel command line: ... blkdevparts=mmcblk1:-@20M(rootfs) ...
+          mmcblk1: p1
+          EXT4-fs (mmcblk1p1): mounted filesystem with ordered data mode
           Run /sbin/init as init process
+          （随后是 systemd 启动日志，登录提示符出现在 ttyS2）
+
+        ========== 若仍失败的快速定位 ==========
+          A. 日志里 Kernel command line 不含 blkdevparts
+             → 刷机工具那行 Parameter 没换成本目录文件，重刷。
+          B. 日志里有 blkdevparts 但没有 "mmcblk1: p1"
+             → 打开本包 kernel.config，确认 CONFIG_CMDLINE_PARTITION=y；
+               这一版 CI 已强制校验，正常不会缺。
+          C. 有 p1 但仍 panic
+             → 看 p1 大小是否等于 3.6GB 左右；若 p1 只有 2MiB，
+               说明 root= 指到了 eMMC 的硬件 boot 分区（mmcblk1boot1），
+               与本包无关。
 
         ========== 账号 ==========
         root 密码: ${ROOT_PASSWORD}
