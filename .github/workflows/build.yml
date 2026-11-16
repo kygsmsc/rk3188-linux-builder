@@ -388,6 +388,61 @@ jobs:
         test -f "$GITHUB_WORKSPACE/dtb_out/${BOARD}.dtb" || { echo "❌ 找不到 ${BOARD}.dtb"; exit 1; }
         echo "✅ 内核与 dtb 编译完成"
 
+        # 【第十轮·守卫】本机没有 SD/TF 卡槽：dts 里 &mmc0 必须是 disabled，
+        # 且 aliases 必须保留 mmc1 = &emmc。
+        # 理由：mmc 控制器编号由 aliases 决定（6.12 drivers/mmc/core/host.c：
+        #   alias_id = of_alias_get_id(dev->of_node, "mmc"); index = alias_id），
+        # eMMC 靠这条别名才固定是 mmc1 → /dev/mmcblk1。
+        # 一旦有人把 mmc0 改回 okay（或删掉 mmc1 别名），eMMC 可能变成 mmcblk0，
+        # 刷机后就是 "Cannot open root device /dev/mmcblk1p1"，白白烧一次 eMMC。
+        python3 "$GITHUB_WORKSPACE/dts/${BOARD}.dts" << 'PY'
+        import re, sys
+        src = open(sys.argv[1], encoding='utf-8').read()
+
+        def node_body(text, token):
+            m = re.search(r'&' + re.escape(token) + r'\s*\{', text)
+            if not m:
+                return None
+            i = m.end() - 1
+            depth = 0
+            for j in range(i, len(text)):
+                if text[j] == '{':
+                    depth += 1
+                elif text[j] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        return text[i + 1:j]
+            return None
+
+        sd = node_body(src, 'mmc0')
+        assert sd is not None, '❌ dts 里找不到 &mmc0 节点'
+        assert 'status = "disabled"' in sd, '❌ &mmc0 必须 disabled（本机无 SD/TF 卡槽）'
+        print('  ✅ &mmc0 = disabled（本机无 SD/TF 卡槽）')
+
+        em = node_body(src, 'emmc')
+        assert em is not None, '❌ dts 里找不到 &emmc 节点'
+        assert 'status = "okay"' in em, '❌ &emmc 必须 okay'
+        assert 'non-removable' in em, '❌ &emmc 必须有 non-removable'
+        print('  ✅ &emmc = okay + non-removable')
+
+        m = re.search(r'aliases\s*\{', src)
+        assert m, '❌ dts 里没有 aliases 节点'
+        i = m.end() - 1
+        depth = 0
+        for j in range(i, len(src)):
+            if src[j] == '{' : depth += 1
+            elif src[j] == '}':
+                depth -= 1
+                if depth == 0:
+                    aliases = src[i + 1:j]
+                    break
+        else:
+            raise SystemExit('❌ aliases 节点括号不配对')
+        assert re.search(r'mmc1\s*=\s*&emmc', aliases), \
+            '❌ aliases 必须保留 mmc1 = &emmc（否则 eMMC 会变成 mmcblk0，root=/dev/mmcblk1p1 失效）'
+        print('  ✅ aliases 保留 mmc1 = &emmc（eMMC 固定 /dev/mmcblk1）')
+        PY
+
     # ============================================================
     # 步骤 7：打包刷机镜像
     # ============================================================
@@ -488,25 +543,36 @@ jobs:
             echo "❌ parameter.txt 的 CMDLINE 缺少 blkdevparts=mmcblk1:-@24M(rootfs)"
             exit 1 ;;
         esac
-        # 【第八轮】ttl-rz8 实测：工具把 rootfs.img 写到了 24MiB，不是 20MiB。
-        # 内核 blkdevparts 与工具 mtdparts 必须指向同一个起点，这里硬校验两个数：
-        #   blkdevparts ... @24M      （字节单位）
-        #   mtdparts    ... @0x0000C000(rootfs)   （扇区单位，0xC000×512=24MiB）
-        # 任何一处漏改，恢复出来的就是前七轮那种 "分区对、ext4 却读不到"。
-        case "${CMDLINE_BOOT}" in
-          *blkdevparts=mmcblk1:-@24M\(rootfs\)*)
-            echo "  ✅ blkdevparts rootfs 起点 = 24MiB" ;;
-          *)
-            echo "❌ blkdevparts 起点必须是与 mtdparts 一致的 24MiB（@24M）"
-            exit 1 ;;
-        esac
-        case "${CMDLINE_BOOT}" in
-          *\-@0x0000C000\(rootfs\)*)
-            echo "  ✅ mtdparts rootfs 起点 = 0x0000C000（24MiB，与 blkdevparts 对齐）" ;;
-          *)
-            echo "❌ mtdparts 的 rootfs 起点必须写成 -@0x0000C000(rootfs)（24MiB）"
-            exit 1 ;;
-        esac
+        # 【第十轮·存储对齐】两轮实测（ttl-rz8/rz9）得到固定规律：
+        #   工具写盘位置 = mtdparts 里 rootfs 的偏移 + boot 的偏移(0x2000 = 4MiB)
+        #     声明 0xA000(20MiB) → 数据落 24MiB（ttl-rz8，且实机 mount 成功）
+        #     声明 0xC000(24MiB) → 数据落 28MiB（ttl-rz9，从未挂载验证过）
+        # 本轮把声明回到教程同款的 0xA000，数据落回唯一验证过的 24MiB，
+        # 内核 blkdevparts 指向 24M：
+        #     boot    0x2000..0xA000（4~20MiB，16MiB 容量）
+        #     rootfs  声明 0xA000(20MiB) → 实际 24MiB
+        #     blkdevparts @24M = 实际落点 = p1 起点（声明/实际/内核一条线）
+        # 校验式：bp 字节数 == (mtdparts 偏移 ×512) + 4MiB，三处漏一处就失败。
+        python3 - "$GITHUB_WORKSPACE/parameter.txt" << 'PYCHK'
+        import re, sys
+        txt = open(sys.argv[1], encoding='utf-8', errors='replace').read()
+        cm = [l for l in txt.splitlines() if l.startswith('CMDLINE:')][0]
+        mb = re.search(r'blkdevparts=mmcblk1:[^ ]*', cm)
+        mt = re.search(r'-\s?@(0x[0-9A-Fa-f]+)\(rootfs\)', cm)
+        assert mb, 'CMDLINE 缺 blkdevparts=mmcblk1:...'
+        assert mt, 'CMDLINE 缺 mtdparts 的 -@0x........(rootfs)'
+        m = re.search(r'@(\d+)M', mb.group(0))
+        assert m, 'blkdevparts 的 rootfs 起点必须是 <数字>M 形式'
+        bp = int(m.group(1)) * 1024 * 1024
+        mtb = int(mt.group(1), 16) * 512
+        expect = mtb + 4 * 1024 * 1024          # 工具会额外加上 boot 基址 0x2000（4MiB）
+        if bp != expect:
+            sys.exit('❌ blkdevparts 起点 %d MiB 与 mtdparts %d MiB 不匹配：'
+                     '按实测规则应为 %d MiB（= mtdparts + 4MiB）'
+                     % (bp >> 20, mtb >> 20, expect >> 20))
+        print('  ✅ blkdevparts rootfs 起点 = %d MiB（mtdparts %d MiB + 工具 4MiB）'
+              % (bp >> 20, mtb >> 20))
+        PYCHK
         case "${CMDLINE_BOOT}" in
           *root=/dev/mmcblk1p1*)
             echo "  ✅ CMDLINE root=/dev/mmcblk1p1（与 blkdevparts 建出的 rootfs=p1 对应）" ;;
@@ -600,24 +666,32 @@ jobs:
         }
 
         log "---- 候选偏移探测（ext4 超级块 magic 应为 53ef）----"
-        FOUND=""
-        for off in 20971520 41943040 25165824 29360128 33554432 16777216 8388608 67108864 134217728 268435456 0; do
+        # 【第九轮】ttl-rz9 的教训：光"有 ext4 超级块"不代表这份数据能用。
+        # 盘上出现了两份 rootfs 头（24MiB 与 28MiB），24MiB 那份超级块还在，
+        # 但它的日志区已被后一次写入覆盖，内核挂载时报：
+        #   JBD2: no valid journal superblock found
+        #   EXT4-fs (mmcblk1p1): Could not load journal inode
+        #   mount: mounting /dev/mmcblk1p1 on /newroot failed: Invalid argument
+        # 所以判定标准从"magic 是不是 53ef"改成"能不能真的挂上、里面有没有
+        # /etc/os-release"——旧拷贝挂不上就自动跳过，选能用的那一份。
+        CANDS=""
+        for off in 29360128 25165824 20971520 33554432 41943040 16777216 8388608 67108864 134217728 268435456 0; do
           m=$(magic_at $off)
           if [ "$m" = "53ef" ]; then
-            log "  $off 字节 (= $(( off / MB )) MiB) : ext4 ✅ 卷标=[$(label_at $off)]"
-            [ -z "$FOUND" ] && FOUND=$off
+            log "  $off 字节 (= $(( off / MB )) MiB) : ext4 超级块 ✅ 卷标=[$(label_at $off)]"
+            CANDS="$CANDS $off"
           else
-            log "  $off 字节 (= $(( off / MB )) MiB) : 无 ext4 (magic=$m)"
+            log "  $off 字节 (= $(( off / MB )) MiB) : 无 ext4 超级块 (magic=$m)"
           fi
         done
 
-        if [ -z "$FOUND" ]; then
+        if [ -z "$CANDS" ]; then
           log "---- 候选都没命中，开始粗扫（1MiB 步长扫 4~128MiB，8MiB 步长扫到盘尾）----"
           off=4194304
           while [ $off -lt 134217728 ]; do
             if [ "$(magic_at $off)" = "53ef" ]; then
               log "  ✅ $off 字节 (= $(( off / MB )) MiB) 有 ext4，卷标=[$(label_at $off)]"
-              [ -z "$FOUND" ] && FOUND=$off
+              CANDS="$CANDS $off"
             fi
             off=$(( off + 1048576 ))
           done
@@ -625,7 +699,7 @@ jobs:
           while [ $off -lt 3866624000 ]; do
             if [ "$(magic_at $off)" = "53ef" ]; then
               log "  ✅ $off 字节 (= $(( off / MB )) MiB) 有 ext4，卷标=[$(label_at $off)]"
-              [ -z "$FOUND" ] && FOUND=$off
+              CANDS="$CANDS $off"
             fi
             off=$(( off + 8388608 ))
           done
@@ -635,41 +709,52 @@ jobs:
         log "---- eMMC 20MiB 处原始前 64 字节（全 00=没写，504b=写成了zip，其它=旧数据）----"
         dd if=$DISK bs=512 skip=40960 count=1 2>/dev/null | od -An -tx1 -N 64
 
-        if [ -z "$FOUND" ]; then
+        if [ -z "$CANDS" ]; then
           log "❌ 所有候选偏移都没有 ext4 超级块 → rootfs.img 没有真正刷进 eMMC"
           log "   请把这段日志发出来；同时核对刷机工具里 rootfs 行的 勾选/文件/地址/耗时"
           exec sh
         fi
 
-        log "✅ 在 $FOUND 字节 (= $(( FOUND / MB )) MiB) 找到 ext4，开始挂载"
+        # 一份 rootfs 算"能用"的条件：挂得上 + 里面有实体文件 os-release/systemd。
+        # 注意不要用 /sbin/init 判断：Ubuntu 的 /sbin 是指向 /usr/sbin 的绝对软链，
+        # 未 chroot 时内核按 initramfs 的 / 解析，必然找不到（第八轮的假报错）。
+        has_rootfs() { [ -e /newroot/etc/os-release ] || [ -e /newroot/usr/lib/systemd/systemd ]; }
 
-        # 【第八轮修正 1】如果找到的起点正好等于内核建出的 p1 起点，就直接挂 p1，
-        # 不绕 loop（loop 那一路在 busybox 下会把 offset 当 ext4 挂载参数传给内核，
-        # ttl-rz8 里就出现了 "ext4: Unknown parameter 'offset'"）。
         P1_START_SECT=$(cat /sys/class/block/mmcblk1p1/start 2>/dev/null)
-        if [ "$P1_START_SECT" = "$(( FOUND / 512 ))" ]; then
-          log "  起点与 mmcblk1p1 一致（p1 start=$P1_START_SECT 扇区），直接挂 /dev/mmcblk1p1"
-          mount -t ext4 -o rw /dev/mmcblk1p1 /newroot
-        else
-          log "  起点与 p1 不一致（p1 start=$P1_START_SECT 扇区），用 loop 挂"
-          losetup -d /dev/loop0 2>/dev/null
-          losetup -o $FOUND /dev/loop0 $DISK 2>/dev/null \
-            && mount -t ext4 -o rw /dev/loop0 /newroot \
-            || mount -t ext4 -o rw,loop,offset=$FOUND $DISK /newroot 2>/dev/null
-        fi
+        log "  内核建出的 mmcblk1p1 起点 = ${P1_START_SECT:-?} 扇区"
 
-        # 【第八轮修正 2】原检查 `[ -e /newroot/sbin/init ]` 在 Ubuntu 上是误判：
-        # /sbin 是指向 /usr/sbin 的绝对软链，未 chroot 时内核按 initramfs 的 / 解析，
-        # 必然找不到 → ttl-rz8 报 "没有 /sbin/init"，其实 rootfs 是好的。
-        # 改成检查不带软链的实体文件。
-        if [ ! -e /newroot/etc/os-release ] && [ ! -e /newroot/usr/lib/systemd/systemd ]; then
-          log "❌ 挂上了，但看不到 /etc/os-release 和 /usr/lib/systemd/systemd —— 镜像内容不完整"
-          log "   （若两者都在，说明是真 rootfs；这里顺带列一下根目录：）"
-          ls -l /newroot | head -20
+        FOUND=""
+        for off in $CANDS; do
+          [ -n "$FOUND" ] && break
+          umount /newroot 2>/dev/null
+          losetup -d /dev/loop0 2>/dev/null
+          log "---- 试挂 $off 字节 (= $(( off / MB )) MiB) ----"
+          if [ "$P1_START_SECT" = "$(( off / 512 ))" ]; then
+            log "  与 mmcblk1p1 起点一致，直接挂 /dev/mmcblk1p1"
+            mount -t ext4 -o rw /dev/mmcblk1p1 /newroot
+          else
+            log "  与 p1 起点不一致（p1=$P1_START_SECT 扇区），用 losetup -o 挂"
+            losetup -o $off /dev/loop0 $DISK 2>/dev/null
+            mount -t ext4 -o rw /dev/loop0 /newroot
+          fi
+          if has_rootfs; then
+            FOUND=$off
+            log "  ✅ 挂载成功，且看到 /etc/os-release：$(head -1 /newroot/etc/os-release 2>/dev/null)"
+            df -h /newroot 2>/dev/null | tail -2
+          else
+            log "  ❌ 这份挂不上/内容不对（很可能是被后一次写入覆盖过的旧拷贝），换下一个"
+            umount /newroot 2>/dev/null
+            losetup -d /dev/loop0 2>/dev/null
+          fi
+        done
+
+        if [ -z "$FOUND" ]; then
+          log "❌ 所有候选都挂不上 → eMMC 里没有一份完整可用的 rootfs"
+          log "   对策：把 rootfs.img 整段重刷一次（只刷 Parameter/boot 不够），再跑"
           exec sh
         fi
-        log "  rootfs 内容确认：$(cat /newroot/etc/os-release 2>/dev/null | head -1)"
-        df -h /newroot 2>/dev/null | tail -2
+
+        log "✅ 真正可用的 rootfs 在 $(( FOUND / MB )) MiB（$FOUND 字节）"
 
         log "✅ rootfs 已挂载，switch_root 到真实 /sbin/init"
         mount -t proc none /newroot/proc 2>/dev/null
@@ -692,31 +777,38 @@ jobs:
         echo "✅ initramfs.cpio.gz: $(stat -c%s "$FINAL_DIR/initramfs.cpio.gz") 字节"
         python3 "$MKI" --verify "$FINAL_DIR/initramfs.cpio.gz" /init /bin/busybox
 
+        # 【第九轮·按教程改正主副角色】
+        # 教程里的 boot.img 只有 kernel + dtb，**不带 ramdisk**；内核自己按
+        # root=/dev/mmcblkXpX 挂上根文件系统，然后 "Run /sbin/init as init process"
+        # —— 教程截图里的 Debian 11 就是这么起来的（EXT4-fs (mmcblk0p1) mounted）。
+        # 我们有内核没挂上根时，就会停在内核里；而把 initramfs 塞进 boot.img 后，
+        # 内核不挂根、全交给我们的 /init，一旦挂载失败就落到 BusyBox 的 "/ #"
+        # 提示符（用户看到的"提示符不对、没有登录"正是这个）。所以：
+        #   boot.img        = 纯内核（教程同款）= 主刷件
+        #   boot-rescue.img = 带救援 initramfs = 只有出问题时才刷的诊断件
+        ./mkbootimg-src/mkbootimg \
+          --kernel zImage-dtb \
+          --cmdline "$CMDLINE_BOOT" \
+          -o "$FINAL_DIR/boot.img"
+        echo "✅ boot.img（纯内核，教程同款，主刷）: $(stat -c%s "$FINAL_DIR/boot.img") 字节"
+
         ./mkbootimg-src/mkbootimg \
           --kernel zImage-dtb \
           --ramdisk "$FINAL_DIR/initramfs.cpio.gz" \
           --ramdiskaddr 0x62000000 \
           --cmdline "$CMDLINE_BOOT" \
-          -o "$FINAL_DIR/boot.img"
-        echo "✅ boot.img（含救援 initramfs）: $(stat -c%s "$FINAL_DIR/boot.img") 字节"
-
-        # 保险件：万一老 loader 对 ramdisk 不感冒，连 "Starting kernel" 都不打，
-        # 就用这个纯内核版 boot-nord.img 回退（行为与前六轮完全一致）。
-        ./mkbootimg-src/mkbootimg \
-          --kernel zImage-dtb \
-          --cmdline "$CMDLINE_BOOT" \
-          -o "$FINAL_DIR/boot-nord.img"
-        echo "✅ boot-nord.img（无 ramdisk，回退用）: $(stat -c%s "$FINAL_DIR/boot-nord.img") 字节"
+          -o "$FINAL_DIR/boot-rescue.img"
+        echo "✅ boot-rescue.img（含救援 initramfs，诊断用）: $(stat -c%s "$FINAL_DIR/boot-rescue.img") 字节"
 
         # ========================================================
-        # 【修改点 D3】回读 boot.img 头做二次确认
+        # 【修改点 D3】回读两个 boot 头做二次确认
         # 标准 Android boot image：magic "ANDROID!"，page_size 16384（RK3188）。
-        # 第七轮起 ramdisk 里带救援 init，所以 ramdisk_size 不再为 0，
-        # 同时要确认 ramdisk_addr 是原厂的 0x62000000、kernel 仍是 0x60408000。
+        # 第九轮起角色对调：boot.img 必须 ramdisk_size=0（教程路线），
+        # boot-rescue.img 必须带 ramdisk 且 ramdisk_addr=0x62000000。
         # ========================================================
-        python3 - "$FINAL_DIR/boot.img" "$FINAL_DIR/boot-nord.img" << 'PY'
+        python3 - "$FINAL_DIR/boot.img" "$FINAL_DIR/boot-rescue.img" << 'PY'
         import sys, struct
-        for path, expect_ramdisk in ((sys.argv[1], True), (sys.argv[2], False)):
+        for path, expect_ramdisk in ((sys.argv[1], False), (sys.argv[2], True)):
             with open(path, 'rb') as f:
                 head = f.read(16384)
             assert head[:8] == b'ANDROID!', path + ' 头不是 ANDROID!（打包格式错误）'
@@ -733,11 +825,11 @@ jobs:
             assert kaddr == 0x60408000, path + ' kernel_addr 应为 0x60408000'
             assert page == 16384, path + ' page_size 应为 16384'
             if expect_ramdisk:
-                assert rsize > 0, 'boot.img 里没有 ramdisk（救援 init 没打进去）'
-                assert raddr == 0x62000000, 'boot.img ramdisk_addr 应为 0x62000000'
+                assert rsize > 0, 'boot-rescue.img 里没有 ramdisk（救援 init 没打进去）'
+                assert raddr == 0x62000000, 'boot-rescue.img ramdisk_addr 应为 0x62000000'
             else:
-                assert rsize == 0, 'boot-nord.img 不应该带 ramdisk'
-        print('✅ 两个 boot 镜像头校验通过（boot.img 带救援 ramdisk，boot-nord.img 纯净）')
+                assert rsize == 0, 'boot.img 必须不带 ramdisk（教程路线：内核自己挂根）'
+        print('✅ 两个 boot 镜像头校验通过（boot.img 纯内核，boot-rescue.img 带救援 ramdisk）')
         PY
 
         if [ -f "$GITHUB_WORKSPACE/inspect_rk_img.sh" ]; then
@@ -770,8 +862,9 @@ jobs:
            四行必须全部【打勾】，地址与文件严格对应：
              #1 Loader     0x00000000   loader.bin（原厂，本包未附带则用现有的）
              #2 Parameter  0x00000000   本目录的 parameter.txt
-             #3 boot       0x00002000   本目录的 boot.img      （= 4 MiB）
-             #4 rootfs     0x0000C000   本目录的 rootfs.img    （= 24 MiB）
+             #3 boot       0x00002000   本目录的 boot.img      （= 4 MiB，纯内核）
+                                        （只有排查问题才换成 boot-rescue.img）
+             #4 rootfs     0x0000C000   本目录的 rootfs.img    （工具实际写到 28 MiB）
         2. 点击 "执行"。rootfs.img 约 1GiB（内容 289MB，下限 1024MB），
            rootfs 那一行会走 1~3 分钟；
            如果整个刷机几秒钟就结束，说明 rootfs 根本没写下去 —— 这就是
@@ -781,30 +874,36 @@ jobs:
            rootfs 分区由内核按 CMDLINE 的 blkdevparts 现场创建。
 
         ========== 刷机前先核对镜像指纹 ==========
-          MANIFEST.sha256 里有 parameter.txt / boot.img / boot-nord.img / rootfs.img
+          MANIFEST.sha256 里有 parameter.txt / boot.img / boot-rescue.img / rootfs.img
           的 SHA256。rootfs.img 下载被截断 = 刷进去没有 ext4 超级块，症状和前几轮
           一模一样。
             Linux  : sha256sum -c MANIFEST.sha256
             Windows: certutil -hashfile rootfs.img SHA256
 
-        ========== ★ 本轮真正的修复：rootfs 起点 20MiB → 24MiB ★ ==========
-          ttl-rz8 里救援 init 逐个偏移扫 ext4 超级块，结果是：
-              20 MiB（0x0000A000）→ magic=0000，没有 ext4
-              24 MiB（0x0000C000）→ ext4，卷标 [rootfs]   ← 真正的 rootfs 在这里
-          而且 20MiB 处前 64 字节是 "ANDROID!"（一个残留的 boot.img 头）。
-          也就是说：RKDevTool 实际把 rootfs.img 写到了 24MiB，不是 parameter 里
-          写的 0xA000。前七轮"分区对了、root 也对了、ext4 却读不到"的真正原因
-          就是这 4MiB 错位 —— 内核去 20MiB 找，数据在 24MiB。
-          （20MiB 不是 8MiB 对齐点，24MiB 是它之后最近的 8MiB 边界，RK 工具按
-           分区粒度对齐写入。）
+        ========== ★ 本轮：回到教程同款偏移，实现"存储对齐" ★ ==========
+          教程日志里那两个 4.00 MiB 是 eMMC 的硬件 boot 分区：
+              mmcblk0boot0: mmc0:0001 Biwin 4.00 MiB
+              mmcblk0boot1: mmc0:0001 Biwin 4.00 MiB
+          本机是 2.00 MiB（mmcblk1boot0/1）。它们和 rootfs 偏移无关，不用对齐。
+          与偏移有关的 4MiB 是 parameter 里的 0x2000 扇区：加载器自家保留区，
+          所以 boot 从 4MiB 起、长 16MiB、到 20MiB(0xA000) 结束。
 
-          本包已经把三处统一到 24MiB：
+          两轮实测（ttl-rz8 / ttl-rz9）得到固定规律：
+              工具写盘位置 = parameter 里 rootfs 声明偏移 + 0x2000 扇区(4MiB)
+              声明 0xA000(20MiB) → 落 24MiB（rz8：挂载成功，df 973.4M）
+              声明 0xC000(24MiB) → 落 28MiB（rz9：从未挂载验证过，且把 24MiB
+                                           那份的日志区碾坏 → JBD2 报错）
+          既然 +4MiB 是死的，就不再追着它改声明，而是回到教程同款的 0xA000：
+
+              boot      0x2000 .. 0xA000   （4MiB ~ 20MiB，16MiB 容量，紧接）
+              rootfs    声明 0xA000(20MiB) → 工具 +4MiB → 实际落 24MiB
+              blkdevparts @24M             → p1 起点 = 24MiB = 数据起点
+              24MiB 是 4MiB 整数倍，对 eMMC 擦除块/页对齐友好
+
+          本包三个文件因此同步（CI 按 "blkdevparts = mtdparts + 4MiB" 硬校验）：
               parameter.txt : blkdevparts=mmcblk1:-@24M(rootfs)
-                              mtdparts=...,-@0x0000C000(rootfs)
-              dts bootargs  : 同上
-              CI 校验       : 两处偏移不一致直接失败
-          所以你按本包 parameter + boot 刷，本包以后的 rootfs 也烧到 24MiB，
-          两边永远对齐。
+                              mtdparts=...,-@0x0000A000(rootfs)
+              dts bootargs  : @24M，与 parameter 同步
 
         ========== 第八轮（仍有效）：Parameter 里的 initrd= 不能删 ==========
           RK31 loader 只有看到 CMDLINE 里的
@@ -813,33 +912,56 @@ jobs:
           救援 init = 白打（ttl-rz7 实证：boot.img 带 ramdisk，内核却不 unpack）。
           原厂 parameter-bibl.txt 里本来就有这一项。
 
-        ========== 这一次请先只刷这两行（快，10MB 级）==========
-          #2 Parameter  0x00000000   parameter.txt   ← 必须换成本包的（@24M）
-          #3 boot       0x00002000   boot.img        ← 带救援 init 的那份
-          rootfs **不要**重刷：盘上 24MiB 那份就是这份 rootfs.img（救援 init 已
-          实测挂上、卷标 [rootfs]、内容 288.8MB 与 CI 打印的 289MB 吻合）。
-          刷完看日志：出现 "Run /sbin/init as init process" 就进系统了。
+        ========== 这一次必须整段刷 rootfs（偏移换了，旧数据在 24MiB 已写坏）==========
+          #1 Loader     0x00000000   （保持原厂，不动）
+          #2 Parameter  0x00000000   本包 parameter.txt
+          #3 boot       0x00002000   本包 boot.img（纯内核，教程同款）
+          #4 rootfs     0x0000A000   本包 rootfs.img   ← 必须刷，约 1GiB，1~3 分钟
+          为什么 rootfs 这次必须刷：上一次写入落在 28MiB，把 24MiB 那份的日志区
+          碾坏了（ttl-rz9 的 JBD2 报错）。现在内核指向 24MiB，只有重新写一份到
+          24MiB 才是干净可挂的。
+          刷完看日志：出现 "Run /sbin/init as init process" 就是进系统了。
+
+        ========== 为什么这一版把 initramfs 从 boot.img 里拿掉了 ==========
+          教程的 boot.img 只有 kernel + dtb，没有 ramdisk：
+              mkbootimg --kernel ../3188/kernel-dtb -o ../3188/boot.img
+          它的 TTL 日志是：
+              EXT4-fs (mmcblk0p1): mounted filesystem
+              Run /sbin/init as init process
+              Welcome to Debian GNU/Linux 11 (bullseye)!
+          也就是**内核自己挂根、自己 exec /sbin/init**，中间没有我们的脚本。
+          前几轮把救援 initramfs 塞进 boot.img 后，内核就不再自己挂根了，
+          全部交给我们那个 /init：挂得上才 switch_root，挂不上就落到 BusyBox 的
+          "/ #"（"sh: can't access tty" 就是它）—— 你看到的"提示符不对、
+          没有登录提示、没有密码输入"就是这么来的，不是系统登录被关了。
+          所以本包：
+              boot.img        = 纯内核（教程路线，主刷件）
+              boot-rescue.img = 带救援 initramfs（只在需要拍照取证时才刷）
 
         ========== 救援 init 会打印什么 ==========
             - /proc/cmdline（核对 initrd= 有没有真的传进来）
-            - 候选偏移逐个报告有没有 ext4 超级块（20MiB / 40MiB / 24MiB / 32MiB ...）
+            - 候选偏移逐个报告有没有 ext4 超级块（24MiB / 20MiB / 28MiB / 32MiB / 40MiB ...）
             - 候选不中时自动粗扫：1MiB 步长扫 4~128MiB，8MiB 步长扫到盘尾
             - 打印 eMMC 20MiB 处原始前 64 字节
               · 全是 00           → rootfs.img 根本没写进去
               · 开头是 504b 0304  → rootfs 那行选的文件其实是 zip，选错文件了
               · 开头是 53ef ...   → 数据在，是偏移/分区起点对不上
-          找到 ext4 就 mount + switch_root 继续启动（偏移不是 20MiB 也能起来）。
+          只有"挂得上并且里面有 /etc/os-release"才认，接着 switch_root 进系统；
+          挂不上的（旧拷贝）自动跳过换下一份 —— 这就是本轮的关键修正。
 
-          ⚠️ 只有"连 Starting kernel... 都不打印"时才用 boot-nord.img。
-             ttl-rz5/6/7 都打印了 Starting kernel，所以那几轮**不该**用 boot-nord.img；
-             如果这次还是看不到 [rescue]，请先确认 #3 那行选的是 boot.img（带 ramdisk 的）。
+          ⚠️ boot-rescue.img 只是诊断件。正常启动**不要**刷它：
+             有 initramfs 时内核不挂根，全靠 /init；挂不上你就只能看到 / #。
+             什么时候才刷它：boot.img 报 "No filesystem could mount root, tried: ext4"
+             或 "VFS: Cannot open root device"，需要知道 eMMC 里到底哪一段有 ext4 时。
 
         ========== 验证成功标志（按顺序出现）==========
           Kernel command line: ... blkdevparts=mmcblk1:-@24M(rootfs) ...
           mmcblk1: p1
           EXT4-fs (mmcblk1p1): mounted filesystem with ordered data mode
-          Run /sbin/init as init process
-          （随后是 systemd 启动日志，登录提示符出现在 ttyS2）
+          Run /sbin/init as init process      ← 教程日志也是这一行
+          （随后是 systemd 启动日志，串口出现 "Ubuntu 22.04 ... login:"。
+            看到 login: 才算进系统；停在 [rescue] 之后的 / # 是 BusyBox 救援 shell，
+            不是系统提示符，也没有登录和密码）
 
         ========== 若仍失败的快速定位 ==========
           A. 日志里 Kernel command line 不含 blkdevparts
@@ -848,10 +970,10 @@ jobs:
              → 打开本包 kernel.config，确认 CONFIG_CMDLINE_PARTITION=y；
                这一版 CI 已强制校验，正常不会缺。
           C. 有 p1、但报 "No filesystem could mount root, tried: ext4"
-             → 分区起点和真实数据错开了。先看 [rescue] 的
-               "候选偏移探测" 那一行：哪个偏移报了 ext4 / 卷标=[rootfs]，
-               就把 parameter.txt 的 blkdevparts @NN M 与 mtdparts
-               -@0x........(rootfs) 都改成那个位置，重刷 Parameter 即可。
+             → 分区起点和真实数据错开了。先刷 boot-rescue.img 跑一次，
+               看它"候选偏移探测 + 试挂"那一行：哪个偏移报"挂载成功"，
+               就把 parameter.txt 的 blkdevparts 改成那个 @NN M（mtdparts 保持
+               比它小 4MiB），重刷 Parameter + boot.img + rootfs 即可。
           D. 有 p1、且能看到 EXT4-fs，但卡在 init
              → 才轮到 rootfs 内部（systemd/getty）问题，届时再发日志。
 
@@ -867,7 +989,7 @@ jobs:
         #   Linux  : sha256sum -c MANIFEST.sha256
         # 指纹一致 → 镜像没坏，问题一定在“刷机时 rootfs 那行有没有真的写下去”。
         # ========================================================
-        ( cd "$FINAL_DIR" && sha256sum parameter.txt boot.img boot-nord.img rootfs.img > MANIFEST.sha256 \
+        ( cd "$FINAL_DIR" && sha256sum parameter.txt boot.img boot-rescue.img rootfs.img > MANIFEST.sha256 \
           && echo "---- MANIFEST.sha256 ----" && cat MANIFEST.sha256 )
 
         ZIP_NAME="${FINAL_DIR}.zip"
