@@ -76,9 +76,9 @@ on:
         options: ['no', 'yes']
         default: 'no'
       rootfs_size:
-        description: 'rootfs.img 最小大小'
-        required: true
-        default: '2G'
+        description: 'rootfs.img 最小大小（1G / 1024M / 纯数字按 MiB；实际取 max(内容×1.3, 本值)，硬下限 1024M）'
+        required: false
+        default: '1G'
 
 permissions:
   contents: write
@@ -453,13 +453,52 @@ jobs:
         mkdir -p "$FINAL_DIR"
 
         ROOTFS_MB=$(sudo du -sm usb_pure_rootfs | cut -f1)
-        IMG_MB=$(( ROOTFS_MB * 130 / 100 ))
-        # 【修改点 F3】镜像下限从 2048MB 降到 1024MB。
-        # 实测 rootfs 实际只有 289MB，做 2GiB 镜像纯属浪费：每次刷机要多写 1GiB，
-        # 刷写时间翻倍、中途被打断/工具写不完的概率也翻倍（这正是这几轮反复怀疑
-        # "rootfs 没写进去" 的根源）。1024MB 对 289MB 的内容仍有 3.5 倍余量。
-        [ "$IMG_MB" -lt 1024 ] && IMG_MB=1024
-        echo "rootfs 实际 ${ROOTFS_MB}MB，镜像 ${IMG_MB}MB（下限 1024MB）"
+        AUTO_MB=$(( ROOTFS_MB * 130 / 100 ))
+
+        # 【第十二轮】把 workflow 输入 rootfs_size 接回来。
+        # 之前这一项只被导出成 ROOTFS_SIZE 环境变量，**没有任何步骤读它**，
+        # 所以界面上填 2G/3G 全部无效，镜像大小实际由下面两行算死：
+        #   AUTO_MB = 内容 × 130%，再硬压到 >=1024MB
+        # 现在：镜像 = max(内容×130%, 你填的最小值)，并保留 1024MB 硬下限。
+        # 单位支持 G/M/K（可带 B），纯数字按 MiB 解释，留空则只用自动值。
+        PARSE_MB=$(python3 - "${ROOTFS_SIZE:-}" <<'PYSIZE'
+        import re, sys
+        raw = (sys.argv[1] if len(sys.argv) > 1 else '').strip()
+        if not raw:
+            print(0)          # 没填 → 0 = 不参与比较
+            raise SystemExit
+        m = re.match(r'^([0-9]+(?:\.[0-9]+)?)\s*([KMGT]?)B?$', raw, re.I)
+        if not m:
+            print(-1)         # -1 = 格式错误
+            raise SystemExit
+        unit = (m.group(2) or 'M').upper()
+        factor = {'K': 1 / 1024, 'M': 1, 'G': 1024, 'T': 1024 * 1024}[unit]
+        print(int(float(m.group(1)) * factor))
+        PYSIZE
+        )
+        if [ "$PARSE_MB" = "-1" ]; then
+          echo "❌ inputs.rootfs_size 格式不对：'${ROOTFS_SIZE}'（示例：1G / 1536M / 1024）"
+          exit 1
+        fi
+
+        IMG_MB=$AUTO_MB
+        if [ "$PARSE_MB" -gt 0 ]; then
+          [ "$PARSE_MB" -gt "$IMG_MB" ] && IMG_MB=$PARSE_MB
+          echo "  输入 rootfs_size = ${ROOTFS_SIZE} → ${PARSE_MB} MiB（作为下限参与取大）"
+        else
+          echo "  输入 rootfs_size 为空 → 只用自动值"
+        fi
+
+        # 【修改点 F3】硬下限 1024MB：内容只有 289MB，做 2GiB 镜像纯属浪费，
+        # 每次刷机多写 1GiB，刷写时间和中途被打断的概率都翻倍（这正是前几轮反复
+        # 怀疑 "rootfs 没写进去" 的根源）。1024MB 对 289MB 仍有 3.5 倍余量。
+        if [ "$IMG_MB" -lt 1024 ]; then
+          if [ "$PARSE_MB" -gt 0 ] && [ "$PARSE_MB" -lt 1024 ]; then
+            echo "  ⚠️ 你填的 ${PARSE_MB} MiB 低于硬下限，已按 1024 MiB 处理"
+          fi
+          IMG_MB=1024
+        fi
+        echo "rootfs 实际 ${ROOTFS_MB}MB → 自动 ${AUTO_MB}MB，镜像最终 ${IMG_MB}MB"
 
         truncate -s "${IMG_MB}M" "$FINAL_DIR/rootfs.img"
         mkfs.ext4 -F -L rootfs "$FINAL_DIR/rootfs.img"
@@ -489,9 +528,10 @@ jobs:
         # ext4 关键位置：超级块在文件偏移 1024，s_magic 在 +0x38（0x53EF），
         # s_volume_name 在 +0x78（应为 rootfs）。
         # ========================================================
-        python3 - "$FINAL_DIR/rootfs.img" << 'PY'
+        python3 - "$FINAL_DIR/rootfs.img" "$IMG_MB" << 'PY'
         import os, sys
         path = sys.argv[1]
+        expect_mb = int(sys.argv[2])
         with open(path, 'rb') as f:
             head = f.read(2048)
         magic = head[1024 + 0x38:1024 + 0x38 + 2]
@@ -502,8 +542,13 @@ jobs:
         print('rootfs.img 卷标      : %r（应为 rootfs）' % label)
         assert magic == b'\x53\xef', 'rootfs.img 0x400+0x38 处不是 ext4 超级块（0x53EF）'
         assert label == 'rootfs', 'rootfs.img 卷标不是 rootfs（/etc/fstab 用 LABEL=rootfs 会挂错）'
-        assert size_mb >= 1024, 'rootfs.img 小于 1GiB，刷进去装不下系统（下限见 F3）'
-        print('✅ rootfs.img 自检通过：是有效 ext4、卷标 rootfs、大小 %.0f MiB' % size_mb)
+        # 期望值来自本步骤算出的 IMG_MB（= max(内容×1.3, 输入 rootfs_size)，下限 1024），
+        # 不再硬编码 1024 —— 否则输入 2G/3G 时这里反而会"校验通过"，掩盖输入失效。
+        assert size_mb >= expect_mb, \
+            'rootfs.img 只有 %.0f MiB，小于本步骤算出的 %d MiB（输入 rootfs_size 未生效？）' \
+            % (size_mb, expect_mb)
+        print('✅ rootfs.img 自检通过：是有效 ext4、卷标 rootfs、大小 %.0f MiB（预期 >= %d）'
+              % (size_mb, expect_mb))
         PY
         echo "---- ext4 头信息（对照刷机后 blkid 应该一致）----"
         dumpe2fs -h "$FINAL_DIR/rootfs.img" 2>/dev/null \
@@ -865,7 +910,7 @@ jobs:
              #3 boot       0x00002000   本目录的 boot.img      （= 4 MiB，纯内核）
                                         （只有排查问题才换成 boot-rescue.img）
              #4 rootfs     0x0000C000   本目录的 rootfs.img    （工具实际写到 28 MiB）
-        2. 点击 "执行"。rootfs.img 约 1GiB（内容 289MB，下限 1024MB），
+        2. 点击 "执行"。rootfs.img 的大小 = max(内容×1.3, 输入 rootfs_size)，硬下限 1024MiB，
            rootfs 那一行会走 1~3 分钟；
            如果整个刷机几秒钟就结束，说明 rootfs 根本没写下去 —— 这就是
            第六轮 "No filesystem could mount root, tried: ext4" 的原因。
