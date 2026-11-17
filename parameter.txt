@@ -28,6 +28,28 @@ KERNEL_IMG:0x60408000
 #   而且 24MiB 是**唯一被实机成功挂载过**的偏移（ttl-rz8 的 losetup -o
 #   25165824 + mount -t ext4 成功，df 报 973.4M 总 / 288.8M 已用）。
 #
+# 【本轮（ttl-rz10）：CMDLINE 里的 initrd= 必须删掉】
+#   ttl-rz10 的日志：
+#     Kernel command line: ... initrd=0x62000000,0x00030000 ...
+#     Trying to unpack rootfs image as initramfs...
+#     Initramfs unpacking failed: junk within compressed archive   ← 那是垃圾
+#     Freeing initrd memory: 192K
+#     mmcblk1: p1(rootfs)                                          ← 分区建对了
+#     Run /init as init process
+#     Failed to execute /init (error -2)
+#     Run /sbin/init as init process
+#     Kernel panic - not syncing: Requested init /sbin/init failed (error -2).
+#   原因链：主刷的 boot.img 已经是**纯内核、没有 ramdisk**，但 CMDLINE 里还留着
+#   initrd=0x62000000,...，loader 就往 0x62000000 交了一个 192K 的**残留垃圾**
+#   （不是我们的 initramfs）。内核于是去"解一个 initramfs"，解包失败后内核
+#   认为早期用户态还在，跳过了挂根这一步，直接 exec /init → /sbin/init，
+#   两者都不存在（error -2 = ENOENT）→ panic。
+#   本版把 initrd= 从主刷 CMDLINE 里删掉：没有 initrd，内核不会去解 initramfs，
+#   会老实执行 prepare_namespace() 去挂 /dev/mmcblk1p1。
+#
+#   ⚠️ 只有刷 boot-rescue.img（带救援 initramfs）时才需要 initrd=，
+#      那种情况请用配套的 parameter-rescue.txt（本目录另附，唯一差别就是这一项）。
+#
 # 【教程日志里那两个 4.00 MiB 是什么（顺手澄清，避免误解）】
 #     mmcblk0boot0: mmc0:0001 Biwin 4.00 MiB
 #     mmcblk0boot1: mmc0:0001 Biwin 4.00 MiB
@@ -75,11 +97,13 @@ KERNEL_IMG:0x60408000
 #       0xA000×512=20MiB(rootfs 标称) → 实际落 24MiB = blkdevparts @24M。
 #       build.yml 里按 "blkdevparts = mtdparts + 4MiB" 做硬校验。
 #
-#   [5] initrd=0x62000000,0x00800000 必须保留
+#   [5] initrd=0x62000000,0x00800000：主刷参数里**必须没有**
 #       RK31 loader 只有看到这一项，才会把 boot.img 里的 ramdisk 搬到 0x62000000
-#       并交给内核（原厂 parameter-bibl.txt 本来就有，教程 parameter 里也有）。
-#       主刷的 boot.img 现在是纯内核（不带 ramdisk），本项对启动没有影响，
-#       但刷 boot-rescue.img 做诊断时全靠它，所以不要删。
+#       交给内核。而主刷 boot.img 是纯内核（不带 ramdisk），留着它只会让 loader
+#       在那个地址上交给内核一段残留垃圾，内核"解 initramfs 失败 + 跳过挂根"
+#       → panic（ttl-rz10 实证）。所以：
+#         主刷（boot.img）        → 本文件，**去掉 initrd=**
+#         诊断（boot-rescue.img） → parameter-rescue.txt，保留 initrd=0x62000000
 #
 #   [6] dwc_driver=2：老 BSP 的 USB 参数，6.12 忽略；日志里
 #       "Unknown kernel command line parameters" 属正常现象。
@@ -87,8 +111,9 @@ KERNEL_IMG:0x60408000
 #   刷机后 TTL 日志应出现（验证标志）：
 #     Kernel command line: ... blkdevparts=mmcblk1:-@24M(rootfs) ...
 #     mmcblk1: p1(rootfs)
+#     （不应再出现 Trying to unpack rootfs image as initramfs）
 #     EXT4-fs (mmcblk1p1): mounted filesystem ...
 #     Run /sbin/init as init process
 #     Ubuntu 22.04 ... login:            ← 看到这一行才算进系统
 # =====================================================================
-CMDLINE:earlyprintk console=ttyS2,115200 root=/dev/mmcblk1p1 rootfstype=ext4 rw rootwait init=/sbin/init initrd=0x62000000,0x00800000 maxcpus=1 blkdevparts=mmcblk1:-@24M(rootfs) mtdparts=rk29xxnand:0x00008000@0x00002000(boot),-@0x0000A000(rootfs) dwc_driver=2
+CMDLINE:earlyprintk console=ttyS2,115200 root=/dev/mmcblk1p1 rootfstype=ext4 rw rootwait init=/sbin/init maxcpus=1 blkdevparts=mmcblk1:-@24M(rootfs) mtdparts=rk29xxnand:0x00008000@0x00002000(boot),-@0x0000A000(rootfs) dwc_driver=2
