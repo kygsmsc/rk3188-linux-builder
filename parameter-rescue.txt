@@ -1,0 +1,130 @@
+FIRMWARE_VER:4.2.2
+MACHINE_MODEL:rk3188-adesk-std
+MACHINE_ID:007
+MANUFACTURER:rk3188
+MAGIC:0x5041524B
+ATAG:0x60000800
+MACHINE:3066
+CHECK_MASK:0x80
+KERNEL_IMG:0x60408000
+
+# =====================================================================
+# parameter.txt — RK3188 aDesk-STD-200H-s / Linux 6.12（第十版·存储对齐）
+#
+# 【本轮：把偏移关系固定成教程同款，实现"声明 → 实际 → 内核"一条线】
+#
+#   boot    0x2000 ~ 0xA000   扇区 0x8000 = 16MiB 容量（4MiB 起，20MiB 止）
+#   rootfs  声明 0x0000A000   = 20MiB，紧接 boot 结束，中间没有空洞
+#   工具写盘 rootfs 实际落点 = 声明 + 0x2000 扇区(4MiB) = 24MiB
+#   内核 blkdevparts      @24M，p1 起点 = 24MiB = 数据起点（严格对齐）
+#
+#   为什么工具会固定 +4MiB：0x2000（4MiB）是加载器自身区（loader 从扇区 0
+#   开始写），工具在给 rootfs 算绝对位置时又叠加了一遍这块偏移。两轮实测
+#   完全一致：
+#     ttl-rz8  声明 0xA000（20MiB） → 数据落 24MiB（挂载成功，df 973.4M）
+#     ttl-rz9  声明 0xC000（24MiB） → 数据落 28MiB（那份从未挂载验证过）
+#   既然这个 +4MiB 是死的，就不再跟它较劲：声明回到 0xA000，数据回到 24MiB，
+#   内核指向 24MiB。24MiB 是 4MiB 整数倍（对 eMMC 擦除块/页对齐友好），
+#   而且 24MiB 是**唯一被实机成功挂载过**的偏移（ttl-rz8 的 losetup -o
+#   25165824 + mount -t ext4 成功，df 报 973.4M 总 / 288.8M 已用）。
+#
+# 【本轮（ttl-rz10）：CMDLINE 里的 initrd= 必须删掉】
+#   ttl-rz10 的日志：
+#     Kernel command line: ... initrd=0x62000000,0x00030000 ...
+#     Trying to unpack rootfs image as initramfs...
+#     Initramfs unpacking failed: junk within compressed archive   ← 那是垃圾
+#     Freeing initrd memory: 192K
+#     mmcblk1: p1(rootfs)                                          ← 分区建对了
+#     Run /init as init process
+#     Failed to execute /init (error -2)
+#     Run /sbin/init as init process
+#     Kernel panic - not syncing: Requested init /sbin/init failed (error -2).
+#   原因链：主刷的 boot.img 已经是**纯内核、没有 ramdisk**，但 CMDLINE 里还留着
+#   initrd=0x62000000,...，loader 就往 0x62000000 交了一个 192K 的**残留垃圾**
+#   （不是我们的 initramfs）。内核于是去"解一个 initramfs"，解包失败后内核
+#   认为早期用户态还在，跳过了挂根这一步，直接 exec /init → /sbin/init，
+#   两者都不存在（error -2 = ENOENT）→ panic。
+#   本版把 initrd= 从主刷 CMDLINE 里删掉：没有 initrd，内核不会去解 initramfs，
+#   会老实执行 prepare_namespace() 去挂 /dev/mmcblk1p1。
+#
+#   ⚠️ 只有刷 boot-rescue.img（带救援 initramfs）时才需要 initrd=，
+#      那种情况请用配套的 parameter-rescue.txt（本目录另附，唯一差别就是这一项）。
+#
+# 【教程日志里那两个 4.00 MiB 是什么（顺手澄清，避免误解）】
+#     mmcblk0boot0: mmc0:0001 Biwin 4.00 MiB
+#     mmcblk0boot1: mmc0:0001 Biwin 4.00 MiB
+#   这是 eMMC 的两个**硬件 boot 分区**尺寸（教程那片 Biwin 是 4MiB，本机
+#   004GA1 是 2.00 MiB：mmcblk1boot0/1）。它们和 rootfs 的读写偏移完全无关，
+#   也不需要我们去对齐——写 rootfs 走的是 user area（mmcblk1）。
+#
+# 【ttl-rz9 为什么还是没进系统】
+#   mmcblk1: p1(rootfs)                      ← 分区造对了，但指向了 24MiB 废拷贝
+#   JBD2: no valid journal superblock found
+#   EXT4-fs (mmcblk1p1): Could not load journal inode
+#   mount: mounting /dev/mmcblk1p1 on /newroot failed: Invalid argument
+#   24MiB 那份超级块还在（所以救援 init 报"找到 ext4、卷标 rootfs"），但它的
+#   日志区被后一次写入（落到 28MiB，写满 1024MiB 覆盖了 28MiB 往后）碾掉了，
+#   内核找不到 JBD2 日志 → 挂载失败 → 救援 init 落到 BusyBox 的 / #
+#   （"提示符不对、没有登录提示"就是这个：那是 initramfs 的 ash，不是 systemd）
+#
+# 【所以这一版必须整段重刷 rootfs.img】
+#   24MiB 那份已经被写坏了，只换 Parameter/boot 不够；按本文件重新刷一次
+#   rootfs，新数据会落在 24MiB，内核 p1 正好指向它。
+#
+# =====================================================================
+# 以下为历史改动记录（第五～九版，结论仍然有效）
+# =====================================================================
+#
+#   [1] CMDLINE 用 blkdevparts 让内核自己造分区
+#       老 RK3188 SDK（Boot ver 2013-12-27#2.10）按 parameter 的绝对扇区裸写镜像，
+#       从不写 MBR/GPT（扇区 0 就是 loader 本体）。所以内核永远扫不到分区表：
+#       ttl-rz4 的 unknown-block(179,1)、分区列表只有整盘即为此证。
+#         blkdevparts=<磁盘名>:<size>[@<offset>](<名字>)
+#         size 为 "-" 表示剩余全部；单位字节，支持 K/M/G；内核内部 >>9 转扇区。
+#       本方案只建 rootfs 一个分区 → 它是 p1，所以 root= 保持 /dev/mmcblk1p1。
+#       依赖 CONFIG_PARTITION_ADVANCED=y + CONFIG_CMDLINE_PARTITION=y（CI 强制校验）。
+#
+#   [2] 不建 boot 分区：loader 用绝对扇区读 boot.img，内核不需要它，
+#       少一个分区就少一次"对号入座"出错的机会。
+#
+#   [3] 不要擦 eMMC 前 1MiB：那里是 loader 本体，擦了盒子就进不了 loader。
+#
+#   [4] 保留 mtdparts=rk29xxnand:0x00008000@0x00002000(boot),-@0x0000A000(rootfs)
+#       mtdparts 是给 RKDevTool/loader 的烧写布局（"标称"地址）；
+#       blkdevparts 是给内核的分区（"实际"落点）。
+#       两者相差 4MiB（0x2000 扇区）是**实测固定规律**，不是笔误：
+#       0x2000×512=4MiB(boot 起点)，0x8000×512=16MiB(boot 长度)，
+#       0xA000×512=20MiB(rootfs 标称) → 实际落 24MiB = blkdevparts @24M。
+#       build.yml 里按 "blkdevparts = mtdparts + 4MiB" 做硬校验。
+#
+#   [5] initrd=0x62000000,0x00800000：主刷参数里**必须没有**
+#       RK31 loader 只有看到这一项，才会把 boot.img 里的 ramdisk 搬到 0x62000000
+#       交给内核。而主刷 boot.img 是纯内核（不带 ramdisk），留着它只会让 loader
+#       在那个地址上交给内核一段残留垃圾，内核"解 initramfs 失败 + 跳过挂根"
+#       → panic（ttl-rz10 实证）。所以：
+#         主刷（boot.img）        → 本文件，**去掉 initrd=**
+#         诊断（boot-rescue.img） → parameter-rescue.txt，保留 initrd=0x62000000
+#
+#   [6] dwc_driver=2：老 BSP 的 USB 参数，6.12 忽略；日志里
+#       "Unknown kernel command line parameters" 属正常现象。
+#
+#   刷机后 TTL 日志应出现（验证标志）：
+#     Kernel command line: ... blkdevparts=mmcblk1:-@24M(rootfs) ...
+#     mmcblk1: p1(rootfs)
+#     （不应再出现 Trying to unpack rootfs image as initramfs）
+#     EXT4-fs (mmcblk1p1): mounted filesystem ...
+#     Run /sbin/init as init process
+#     Ubuntu 22.04 ... login:            ← 看到这一行才算进系统
+# =====================================================================
+# =====================================================================
+# parameter-rescue.txt — 只用于刷 boot-rescue.img（带救援 initramfs）诊断
+#
+# 与 parameter.txt 的**唯一差别**：CMDLINE 里保留 initrd=0x62000000,0x00800000。
+# RK31 loader 看到这一项才会把 boot.img 里的 ramdisk 搬到 0x62000000 交给内核；
+# 主刷的 boot.img 是纯内核、没有 ramdisk，所以主刷参数里必须去掉这一项
+# （否则内核会去解一段残留垃圾，跳过挂根 → ttl-rz10 的 panic）。
+#
+# 用法：把本文件放在 RKDevTool 的 Parameter 行（地址 0x00000000），boot 行
+# 选 boot-rescue.img。启动后它会打印候选偏移探测 + 逐个试挂结果。
+# =====================================================================
+CMDLINE:earlyprintk console=ttyS2,115200 root=/dev/mmcblk1p1 rootfstype=ext4 rw rootwait init=/sbin/init initrd=0x62000000,0x00800000 maxcpus=1 blkdevparts=mmcblk1:-@24M(rootfs) mtdparts=rk29xxnand:0x00008000@0x00002000(boot),-@0x0000A000(rootfs) dwc_driver=2
