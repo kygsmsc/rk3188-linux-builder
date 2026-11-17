@@ -629,15 +629,34 @@ jobs:
             exit 1 ;;
         esac
 
-        # 【第七轮】loader 只有在 CMDLINE 里看到 initrd=<addr>,<size> 时才会把
-        # boot.img 里的 ramdisk 搬到该地址并传 ATAG；ttl-rz7 就是缺这一项，
-        # 所以内核完全没 unpack initramfs。缺它 = 救援 init 白打，直接判失败。
+        # 【ttl-rz10 修正】主刷 boot.img 是纯内核（ramdisk_size=0），CMDLINE 里
+        # **绝不能**再有 initrd=。留着它，loader 会在 0x62000000 上交给内核一段
+        # 192K 的残留垃圾，内核 "Trying to unpack rootfs image as initramfs" →
+        # "junk within compressed archive" → 跳过挂根 → Run /init（ENOENT）→
+        # Run /sbin/init（ENOENT）→ panic。rz10 就是这个死法。
         case "${CMDLINE_BOOT}" in
-          *initrd=0x62000000,*)
-            echo "  ✅ CMDLINE 含 initrd=0x62000000,...（loader 会搬 ramdisk）" ;;
-          *)
-            echo "❌ CMDLINE 缺少 initrd=0x62000000,0x00800000"
+          *initrd=*)
+            echo "❌ 主刷 parameter 的 CMDLINE 里不该有 initrd=（boot.img 没有 ramdisk，会把垃圾当 initramfs 解）"
+            echo "   要用 initrd= 请刷 boot-rescue.img 并改用 parameter-rescue.txt"
             exit 1 ;;
+          *)
+            echo "  ✅ CMDLINE 无 initrd=（与纯内核 boot.img 匹配，内核会直接挂根）" ;;
+        esac
+
+        # 救援参数必须存在且带 initrd=，否则 boot-rescue.img 里的 initramfs 不会被搬
+        RESCUE_PARAM="${GITHUB_WORKSPACE}/parameter-rescue.txt"
+        [ -f "$RESCUE_PARAM" ] || { echo "❌ 仓库里缺 parameter-rescue.txt"; exit 1; }
+        RESCUE_CMDLINE=$(grep -m1 '^CMDLINE:' "$RESCUE_PARAM" | sed 's/^CMDLINE://')
+        case "$RESCUE_CMDLINE" in
+          *initrd=0x62000000,*)
+            echo "  ✅ parameter-rescue.txt 含 initrd=0x62000000,...（可供 boot-rescue.img 使用）" ;;
+          *)
+            echo "❌ parameter-rescue.txt 的 CMDLINE 缺 initrd=0x62000000,0x00800000"
+            exit 1 ;;
+        esac
+        case "$RESCUE_CMDLINE" in
+          *blkdevparts=mmcblk1:*rootfs*) : ;;
+          *) echo "❌ parameter-rescue.txt 的 blkdevparts 与主参数不一致"; exit 1 ;;
         esac
         [ "${#CMDLINE_BOOT}" -le 500 ] \
           || { echo "❌ CMDLINE ${#CMDLINE_BOOT} 字节，超过 boot.img 头 512 字节上限"; exit 1; }
@@ -887,6 +906,8 @@ jobs:
         fi
 
         cp "$GITHUB_WORKSPACE/parameter.txt" "$FINAL_DIR/parameter.txt"
+        # 救援件配套参数（唯一差别：CMDLINE 保留 initrd=），只给 boot-rescue.img 用
+        cp "$GITHUB_WORKSPACE/parameter-rescue.txt" "$FINAL_DIR/parameter-rescue.txt"
         cp "$GITHUB_WORKSPACE/kernel.config" "$FINAL_DIR/kernel.config"
 
         # ========================================================
@@ -922,7 +943,7 @@ jobs:
            rootfs 分区由内核按 CMDLINE 的 blkdevparts 现场创建。
 
         ========== 刷机前先核对镜像指纹 ==========
-          MANIFEST.sha256 里有 parameter.txt / boot.img / boot-rescue.img / rootfs.img
+          MANIFEST.sha256 里有 parameter.txt / parameter-rescue.txt / boot.img / boot-rescue.img / rootfs.img
           的 SHA256。rootfs.img 下载被截断 = 刷进去没有 ext4 超级块，症状和前几轮
           一模一样。
             Linux  : sha256sum -c MANIFEST.sha256
@@ -953,22 +974,40 @@ jobs:
                               mtdparts=...,-@0x0000A000(rootfs)
               dts bootargs  : @24M，与 parameter 同步
 
-        ========== 第八轮（仍有效）：Parameter 里的 initrd= 不能删 ==========
-          RK31 loader 只有看到 CMDLINE 里的
-              initrd=0x62000000,0x00800000
-          才会把 boot.img 里的 ramdisk 搬到 0x62000000 交给内核；删掉它，
-          救援 init = 白打（ttl-rz7 实证：boot.img 带 ramdisk，内核却不 unpack）。
-          原厂 parameter-bibl.txt 里本来就有这一项。
+        ========== ★ 本轮（ttl-rz10 之后）修的是 initrd= ★ ==========
+          ttl-rz10 的日志：
+              Kernel command line: ... initrd=0x62000000,0x00030000 ...
+              Trying to unpack rootfs image as initramfs...
+              Initramfs unpacking failed: junk within compressed archive
+              Freeing initrd memory: 192K
+              mmcblk1: p1(rootfs)                       ← 分区造对了
+              Run /init as init process
+              Failed to execute /init (error -2)
+              Run /sbin/init as init process
+              Kernel panic - not syncing: Requested init /sbin/init failed (error -2).
+          逐句翻译：
+            · 主刷的 boot.img 是纯内核、没有 ramdisk，但 CMDLINE 里还留着
+              initrd=0x62000000,...，于是 loader 在 0x62000000 上交给内核一段
+              192K 的**残留垃圾**（不是我们的 initramfs）；
+            · 内核"以为"有早期用户态（initramfs），去解包 → "junk within
+              compressed archive" 失败，然后**跳过了挂根那一步**；
+            · 于是它直接 exec /init，而空 ramfs 里没有 /init（error -2 = ENOENT），
+              再 exec /sbin/init，也没有 → panic。
+          结论：**主刷 parameter 的 CMDLINE 里必须没有 initrd=**。
+          本包已去掉；需要 initrd= 的场合（刷 boot-rescue.img）改用
+          parameter-rescue.txt（与主参数的唯一差别就是保留了这一项）。
+          注意：从头到尾**没有出现过 EXT4-fs 挂载行**，说明根分区压根没被尝试挂载
+          ——不是 rootfs 数据坏了，是内核在挂根之前就 panic 了。
 
-        ========== 这一次必须整段刷 rootfs（偏移换了，旧数据在 24MiB 已写坏）==========
-          #1 Loader     0x00000000   （保持原厂，不动）
-          #2 Parameter  0x00000000   本包 parameter.txt
+        ========== 这一次先只刷两行（10MB 级，最快）==========
+          #2 Parameter  0x00000000   本包 parameter.txt（已去掉 initrd=）
           #3 boot       0x00002000   本包 boot.img（纯内核，教程同款）
-          #4 rootfs     0x0000A000   本包 rootfs.img   ← 必须刷，约 1GiB，1~3 分钟
-          为什么 rootfs 这次必须刷：上一次写入落在 28MiB，把 24MiB 那份的日志区
-          碾坏了（ttl-rz9 的 JBD2 报错）。现在内核指向 24MiB，只有重新写一份到
-          24MiB 才是干净可挂的。
-          刷完看日志：出现 "Run /sbin/init as init process" 就是进系统了。
+          rootfs 这次先不刷：如果上一轮已按 4 行整段刷过 rootfs.img，24MiB 那份就是
+          新写的；这次失败与它无关（内核根本没挂根）。刷完看日志：
+              mmcblk1: p1(rootfs)
+              EXT4-fs (mmcblk1p1): mounted filesystem ...   ← 这一行才是关键
+              Run /sbin/init as init process
+          若 24MiB 那份报 EXT4/JBD2 错误，再整段刷一次 rootfs（约 1GiB，1~3 分钟）。
 
         ========== 为什么这一版把 initramfs 从 boot.img 里拿掉了 ==========
           教程的 boot.img 只有 kernel + dtb，没有 ramdisk：
@@ -986,7 +1025,7 @@ jobs:
               boot.img        = 纯内核（教程路线，主刷件）
               boot-rescue.img = 带救援 initramfs（只在需要拍照取证时才刷）
 
-        ========== 救援 init 会打印什么 ==========
+        ========== 救援 init 会打印什么（刷 boot-rescue.img + parameter-rescue.txt）==========
             - /proc/cmdline（核对 initrd= 有没有真的传进来）
             - 候选偏移逐个报告有没有 ext4 超级块（24MiB / 20MiB / 28MiB / 32MiB / 40MiB ...）
             - 候选不中时自动粗扫：1MiB 步长扫 4~128MiB，8MiB 步长扫到盘尾
@@ -1003,8 +1042,9 @@ jobs:
              或 "VFS: Cannot open root device"，需要知道 eMMC 里到底哪一段有 ext4 时。
 
         ========== 验证成功标志（按顺序出现）==========
-          Kernel command line: ... blkdevparts=mmcblk1:-@24M(rootfs) ...
-          mmcblk1: p1
+          Kernel command line: ... blkdevparts=mmcblk1:-@24M(rootfs) ...（且没有 initrd=）
+          mmcblk1: p1(rootfs)
+          （不应再出现 "Trying to unpack rootfs image as initramfs"）
           EXT4-fs (mmcblk1p1): mounted filesystem with ordered data mode
           Run /sbin/init as init process      ← 教程日志也是这一行
           （随后是 systemd 启动日志，串口出现 "Ubuntu 22.04 ... login:"。
@@ -1037,7 +1077,7 @@ jobs:
         #   Linux  : sha256sum -c MANIFEST.sha256
         # 指纹一致 → 镜像没坏，问题一定在“刷机时 rootfs 那行有没有真的写下去”。
         # ========================================================
-        ( cd "$FINAL_DIR" && sha256sum parameter.txt boot.img boot-rescue.img rootfs.img > MANIFEST.sha256 \
+        ( cd "$FINAL_DIR" && sha256sum parameter.txt parameter-rescue.txt boot.img boot-rescue.img rootfs.img > MANIFEST.sha256 \
           && echo "---- MANIFEST.sha256 ----" && cat MANIFEST.sha256 )
 
         ZIP_NAME="${FINAL_DIR}.zip"
