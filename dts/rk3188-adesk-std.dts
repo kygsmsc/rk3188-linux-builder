@@ -89,7 +89,16 @@
 		// 原值（保留备查；第七轮时的形态：无 initrd=，rootfs 起点 20M = 0xA000）：
 		// bootargs = "console=ttyS2,115200 earlyprintk root=/dev/mmcblk1p1 rootfstype=ext4 rw rootwait init=/sbin/init maxcpus=1 blkdevparts=mmcblk1:-@20M(rootfs)";
 		// 原值（第九轮，保留备查）：blkdevparts=mmcblk1:-@28M(rootfs)（本轮回到 @24M，见上方注释）
-		bootargs = "console=ttyS2,115200 earlyprintk root=/dev/mmcblk1p1 rootfstype=ext4 rw rootwait init=/sbin/init initrd=0x62000000,0x00800000 maxcpus=1 blkdevparts=mmcblk1:-@24M(rootfs)";
+		// 原值（第十轮，保留备查）：... init=/sbin/init initrd=0x62000000,0x00800000 maxcpus=1 ...
+		// 【ttl-rz10 改动：去掉 initrd=0x62000000,0x00800000】
+		// 主刷的 boot.img 是纯内核（没有 ramdisk），但 CMDLINE 里带 initrd= 会让
+		// loader 在 0x62000000 上交给内核一段 192K 残留垃圾，内核就去"解 initramfs"
+		// → "junk within compressed archive" 失败 → 跳过挂根 → exec /init(ENOENT)
+		// → exec /sbin/init(ENOENT) → panic（ttl-rz10 实测）。
+		// 去掉后内核对 initramfs 不再有期待，会正常执行挂根流程。
+		// 只有刷 boot-rescue.img（带救援 initramfs）时才需要它，那份走
+		// parameter-rescue.txt，不改这里（这里的 bootargs 是 loader 不传 ATAG 时的兜底）。
+		bootargs = "console=ttyS2,115200 earlyprintk root=/dev/mmcblk1p1 rootfstype=ext4 rw rootwait init=/sbin/init maxcpus=1 blkdevparts=mmcblk1:-@24M(rootfs)";
 	};
 
 	memory@60000000 {
