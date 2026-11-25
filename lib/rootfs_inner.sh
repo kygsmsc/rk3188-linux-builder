@@ -181,13 +181,42 @@ ln -sf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
 echo "$TIMEZONE" > /etc/timezone
 dpkg-reconfigure -f noninteractive tzdata >/dev/null 2>&1 || true
 
+# ---- 修改点 C：刷机后自动把根文件系统扩满 eMMC（第二十一轮）----
+# 现象：rootfs.img 是按 rootfs_size=1G 造的，刷进去后 df -h 只有 974M，
+#   eMMC 剩下的 2.5G 用不上——因为分区是 blkdevparts 的 "-@24M(rootfs)"
+#   （一直延伸到盘尾），但文件系统只有 1G。
+# 原值（保留备查）：
+# LABEL=rootfs     /              ext4       defaults,noatime,errors=remount-ro 0     1
+# 改动：给根分区加 x-systemd.growfs，systemd 挂载时会自动把 ext4 扩到分区大小
+#   （systemd-growfs 用 EXT4_IOC_RESIZE_FS 在线扩，不需要 resize2fs 二进制）。
 cat > /etc/fstab << 'FSTAB'
-LABEL=rootfs     /              ext4       defaults,noatime,errors=remount-ro 0     1
+LABEL=rootfs     /              ext4       defaults,noatime,errors=remount-ro,x-systemd.growfs 0     1
 proc             /proc          proc       defaults                          0     0
 sysfs            /sys           sysfs      defaults                          0     0
 devtmpfs         /dev           devtmpfs   mode=0755,nosuid                  0     0
 tmpfs            /tmp           tmpfs      defaults,nosuid,size=64M          0     0
 FSTAB
+
+# ---- 修改点 D：兜底一次性扩容服务（防止 x-systemd.growfs 在该 systemd 版本上没触发）----
+R2F="$(command -v resize2fs 2>/dev/null || true)"
+[ -n "$R2F" ] || R2F=/sbin/resize2fs
+cat > /etc/systemd/system/rootfs-grow.service << UNIT
+[Unit]
+Description=First boot: grow root ext4 filesystem to fill the whole eMMC partition
+Documentation=man:resize2fs(8)
+ConditionPathExists=!/var/lib/.rootfs-grown
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=${R2F} /dev/mmcblk1p1
+ExecStartPost=/bin/sh -c 'mkdir -p /var/lib && touch /var/lib/.rootfs-grown'
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl enable rootfs-grow.service 2>/dev/null || true
 
 echo "root:$ROOT_PASSWORD" | chpasswd
 sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config 2>/dev/null || true
@@ -349,7 +378,20 @@ find /home -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
 #   systemctl daemon-reload
 SERIAL_ONLY="${SERIAL_ONLY:-yes}"
 if [ "${SERIAL_ONLY}" = "yes" ]; then
+  # 先走 systemctl（脚本开头已 export SYSTEMD_OFFLINE=1，chroot 内可离线生效）
   systemctl mask systemd-resolved.service NetworkManager.service networking.service wpa_supplicant.service 2>/dev/null || true
+  # 兜底：systemctl 在 chroot 里万一降级失败，就直接手工建符号链接，保证一定落盘
+  for u in systemd-resolved NetworkManager networking wpa_supplicant; do
+    if [ ! -L "/etc/systemd/system/${u}.service" ]; then
+      mkdir -p /etc/systemd/system
+      ln -snf /dev/null "/etc/systemd/system/${u}.service" 2>/dev/null || true
+    fi
+    if [ -L "/etc/systemd/system/${u}.service" ]; then
+      echo "   masked: ${u}.service -> $(readlink /etc/systemd/system/${u}.service)"
+    else
+      echo "❌ 无法 mask ${u}.service（构建产物可能仍会卡在 network.target）"
+    fi
+  done
   echo "✅ SERIAL_ONLY=yes：已 mask 网络栈（systemd-resolved / NetworkManager / networking / wpa_supplicant）"
 else
   echo "ℹ️  SERIAL_ONLY=no：保留网络栈（若 systemd-resolved 不 ready，串口 getty 会被压住）"
