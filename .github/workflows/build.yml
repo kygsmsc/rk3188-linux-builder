@@ -395,9 +395,13 @@ jobs:
         # 每次构建种子都不同（唯一残留弱点：同一份固件每次启动种子相同）。
         # ========================================================
         python3 - << 'PY'
-        import glob, re, secrets
+        import glob, os, re, secrets
 
-        files = sorted(glob.glob("arch/${ARCH}/boot/dts/rockchip/*.dts"))
+        # 注意：本 heredoc 用 << 'PY'（带引号），shell 不会展开 ${ARCH}，
+        # 所以这里必须从环境变量取 ARCH，不能写 ${ARCH} 字面量。
+        arch = os.environ.get("ARCH", "arm")
+        pattern = "arch/" + arch + "/boot/dts/rockchip/*.dts"
+        files = sorted(glob.glob(pattern))
         if not files:
             raise SystemExit("FAIL: no dts found in kernel tree")
 
