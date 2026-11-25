@@ -643,21 +643,27 @@ jobs:
             echo "  ✅ CMDLINE 无 initrd=（与纯内核 boot.img 匹配，内核会直接挂根）" ;;
         esac
 
-        # 救援参数必须存在且带 initrd=，否则 boot-rescue.img 里的 initramfs 不会被搬
+        # 救援参数（只给 boot-rescue.img 用）：仓库里有就校验，没有就由主参数派生。
+        # 之前这里写成"没有就失败"，会逼着仓库多维护一份容易漂移的文件；
+        # 救援件本来就是可选的诊断件，改成派生更稳：
+        #   parameter-rescue.txt = parameter.txt + 在 init=/sbin/init 后插回 initrd=
         RESCUE_PARAM="${GITHUB_WORKSPACE}/parameter-rescue.txt"
-        [ -f "$RESCUE_PARAM" ] || { echo "❌ 仓库里缺 parameter-rescue.txt"; exit 1; }
-        RESCUE_CMDLINE=$(grep -m1 '^CMDLINE:' "$RESCUE_PARAM" | sed 's/^CMDLINE://')
-        case "$RESCUE_CMDLINE" in
-          *initrd=0x62000000,*)
-            echo "  ✅ parameter-rescue.txt 含 initrd=0x62000000,...（可供 boot-rescue.img 使用）" ;;
-          *)
-            echo "❌ parameter-rescue.txt 的 CMDLINE 缺 initrd=0x62000000,0x00800000"
-            exit 1 ;;
-        esac
-        case "$RESCUE_CMDLINE" in
-          *blkdevparts=mmcblk1:*rootfs*) : ;;
-          *) echo "❌ parameter-rescue.txt 的 blkdevparts 与主参数不一致"; exit 1 ;;
-        esac
+        if [ -f "$RESCUE_PARAM" ]; then
+          RESCUE_CMDLINE=$(grep -m1 '^CMDLINE:' "$RESCUE_PARAM" | sed 's/^CMDLINE://')
+          case "$RESCUE_CMDLINE" in
+            *initrd=0x62000000,*)
+              echo "  ✅ 仓库自带 parameter-rescue.txt，且含 initrd=0x62000000（供 boot-rescue.img 使用）" ;;
+            *)
+              echo "❌ 仓库里的 parameter-rescue.txt 缺 initrd=0x62000000,0x00800000（删掉它就用自动派生的）"
+              exit 1 ;;
+          esac
+          case "$RESCUE_CMDLINE" in
+            *blkdevparts=mmcblk1:*rootfs*) : ;;
+            *) echo "❌ 仓库里的 parameter-rescue.txt 与主参数 blkdevparts 不一致"; exit 1 ;;
+          esac
+        else
+          echo "  ⚠️ 仓库未提供 parameter-rescue.txt → 产物里用 parameter.txt 自动派生（只影响 boot-rescue.img）"
+        fi
         [ "${#CMDLINE_BOOT}" -le 500 ] \
           || { echo "❌ CMDLINE ${#CMDLINE_BOOT} 字节，超过 boot.img 头 512 字节上限"; exit 1; }
 
@@ -906,8 +912,46 @@ jobs:
         fi
 
         cp "$GITHUB_WORKSPACE/parameter.txt" "$FINAL_DIR/parameter.txt"
-        # 救援件配套参数（唯一差别：CMDLINE 保留 initrd=），只给 boot-rescue.img 用
-        cp "$GITHUB_WORKSPACE/parameter-rescue.txt" "$FINAL_DIR/parameter-rescue.txt"
+        # 救援件配套参数（唯一差别：CMDLINE 保留 initrd=），只给 boot-rescue.img 用。
+        # 仓库里有就用仓库的；没有就从 parameter.txt 现派生一份，保证 blkdevparts
+        # 与主参数永远一致（避免两份文件各改各的）。
+        if [ -f "$GITHUB_WORKSPACE/parameter-rescue.txt" ]; then
+          cp "$GITHUB_WORKSPACE/parameter-rescue.txt" "$FINAL_DIR/parameter-rescue.txt"
+          echo "✅ parameter-rescue.txt（取自仓库）"
+        else
+          python3 - "$GITHUB_WORKSPACE/parameter.txt" "$FINAL_DIR/parameter-rescue.txt" << 'PY'
+          import sys
+          src, dst = sys.argv[1], sys.argv[2]
+          banner = [
+              '# =====================================================================',
+              '# parameter-rescue.txt —— 由 parameter.txt 自动派生（仓库未提供该文件）',
+              '#',
+              '# 唯一差别：CMDLINE 里保留 initrd=0x62000000,0x00800000。',
+              '# RK31 loader 看到这一项才会把 boot.img 里的 ramdisk 搬到 0x62000000；',
+              '# 只给 boot-rescue.img（带救援 initramfs）用。主刷 boot.img 是纯内核，',
+              '# 带 initrd= 会让内核去解一段残留垃圾并跳过挂根（ttl-rz10 的 panic）。',
+              '# =====================================================================',
+          ]
+          out = []
+          for line in open(src, encoding='utf-8').read().splitlines():
+              if line.startswith('CMDLINE:'):
+                  out.extend(banner)
+                  assert ' init=/sbin/init ' in line, 'parameter.txt 的 CMDLINE 里没有 init=/sbin/init'
+                  line = line.replace(' init=/sbin/init ',
+                                      ' init=/sbin/init initrd=0x62000000,0x00800000 ', 1)
+              out.append(line)
+          open(dst, 'w', encoding='utf-8').write('\n'.join(out) + '\n')
+          print('✅ parameter-rescue.txt（由 parameter.txt 自动派生）')
+          PY
+          python3 - "$FINAL_DIR/parameter-rescue.txt" << 'PY'
+          import sys
+          cm = [l for l in open(sys.argv[1], encoding='utf-8')
+                if l.startswith('CMDLINE:')][0]
+          assert 'initrd=0x62000000,' in cm, '派生失败：没有写进 initrd='
+          assert 'blkdevparts=mmcblk1:' in cm, '派生失败：blkdevparts 丢了'
+          print('  ✅ 派生结果校验通过：有 initrd=、有 blkdevparts')
+          PY
+        fi
         cp "$GITHUB_WORKSPACE/kernel.config" "$FINAL_DIR/kernel.config"
 
         # ========================================================
