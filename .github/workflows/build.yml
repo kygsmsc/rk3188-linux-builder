@@ -368,6 +368,57 @@ jobs:
         mkdir -p "arch/${ARCH}/boot/dts/rockchip"
         cp "$GITHUB_WORKSPACE/dts/"*.dts "arch/${ARCH}/boot/dts/rockchip/"
 
+        # ========================================================
+        # 【第二十轮 RNG：给内核一份可信启动熵，修纯净启动静默卡死】
+        #
+        # 现象：纯 parameter.txt 启动（内核直接跑 /sbin/init）时，串口停在
+        #   systemd[1]: Hostname set to <rk3188>.
+        # 就再也不动，一个 unit 都没起，回车无反应；而 init=/bin/sh 之后再
+        # exec /sbin/init（此时 uptime 已过 25~140 秒）却能一路到 login。
+        #
+        # 依据（6.12.116 源码，已逐行核对）：
+        #   drivers/char/random.c:976
+        #     void __init add_bootloader_randomness(const void *buf, size_t len)
+        #     { mix_pool_bytes(buf, len); if (trust_bootloader) credit_init_bits(len * 8); }
+        #   random.c 里 trust_bootloader / trust_cpu 的 __initdata 默认都是 true；
+        #   drivers/of/fdt.c:early_init_dt_scan_chosen() 读 /chosen/rng-seed，
+        #   调 add_bootloader_randomness()，随后 fdt_nop_property() 把种子抹掉。
+        #   => DTB 里给 64 字节 rng-seed，内核在解析 DT 那一刻（远早于 init）
+        #      就把 CRNG 初始化完成，systemd 的 getrandom() 不再阻塞。
+        #
+        # 为什么这台机器必须这么做：defconfig 里没有可用 HWRNG
+        #   （CONFIG_HW_RANDOM=y 但只开了 OPTEE；Cortex-A9 也没有 RDRAND），
+        #   RK3188 的 crypto 没有 mainline hwrng 驱动，冷启动只能靠中断抖动攒熵，
+        #   2.7 秒的冷启动攒不够 256 bit，于是 PID1 就停在 getrandom 上等。
+        #
+        # 下面只改【拷进内核树的那份 dts】，仓库里的 dts 源文件保持干净可读；
+        # 每次构建种子都不同（唯一残留弱点：同一份固件每次启动种子相同）。
+        # ========================================================
+        python3 - << 'PY'
+        import glob, re, secrets
+
+        files = sorted(glob.glob("arch/${ARCH}/boot/dts/rockchip/*.dts"))
+        if not files:
+            raise SystemExit("FAIL: no dts found in kernel tree")
+
+        for path in files:
+            text = open(path, encoding="utf-8").read()
+            if "rng-seed" in text:
+                print("  = already has rng-seed:", path)
+                continue
+            seed = " ".join("%02x" % b for b in secrets.token_bytes(64))
+            new, n = re.subn(r"chosen\s*\{", "chosen {\n\t\trng-seed = [" + seed + "];", text, count=1)
+            if n != 1:
+                raise SystemExit("FAIL: no chosen node in " + path)
+            open(path, "w", encoding="utf-8").write(new)
+            print("  + injected 64-byte rng-seed into", path)
+
+        for path in files:
+            if "rng-seed = [" not in open(path, encoding="utf-8").read():
+                raise SystemExit("FAIL: rng-seed injection verify failed for " + path)
+        print("  OK: rng-seed injected and verified")
+        PY
+
         make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" -j"$(nproc)" "${KERNEL_IMAGE}"
         make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" -j"$(nproc)" dtbs
         make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" -j"$(nproc)" modules
