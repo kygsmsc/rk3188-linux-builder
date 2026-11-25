@@ -92,7 +92,18 @@ fi
 apt-get update -qq
 apt-get -f install -y -qq 2>&1 || true
 
-PKGS="systemd systemd-sysv dbus udev \
+# ---- 修改点 A：补 kmod（ttl-11 实证）----
+# 原值（保留备查）：
+# PKGS="systemd systemd-sysv dbus udev \
+#   ifupdown isc-dhcp-client iproute2 iputils-ping iputils-arping procps \
+#   openssh-server ssh sudo e2fsprogs ca-certificates \
+#   vim-tiny less wget curl cron locales tzdata \
+#   file network-manager wpasupplicant iw rfkill iptables systemd-timesyncd"
+# 为什么补：缺 kmod 时 /bin/kmod、/sbin/modprobe 都不存在，导致
+#   kmod-static-nodes.service 报 "Failed at step EXEC spawning /bin/kmod"，
+#   modprobe@configfs/drm/fuse/efi_pstore 全部 "Executable /sbin/modprobe missing, skipping"，
+#   文末的 depmod -a 也无法执行（内核模块依赖表建不出来）。
+PKGS="systemd systemd-sysv dbus udev kmod \
   ifupdown isc-dhcp-client iproute2 iputils-ping iputils-arping procps \
   openssh-server ssh sudo e2fsprogs ca-certificates \
   vim-tiny less wget curl cron locales tzdata \
@@ -321,6 +332,28 @@ find /root -mindepth 1 -maxdepth 1 \
     ! -name '.cache' ! -name '.local' -exec rm -rf {} + 2>/dev/null || true
 find /tmp  -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
 find /home -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+
+# ---- 修改点 B：串口优先，默认屏蔽网络栈（ttl-11 实证）----
+# 现象（ttl-9 / ttl-11 的 debug 日志）：
+#   systemd-resolved.service 起来了，但永远不 acquire "org.freedesktop.resolve1"，
+#   于是 network.target 永远完不成 →
+#   systemd-user-sessions.service 被压住 →
+#   serial-getty@ttyS2.service 被压住 →
+#   屏幕永远不出 login:（这就是十几轮"卡住"的真正原因）。
+# 做法：默认整条网络栈 mask 掉，刷机即得 login:。
+# 要用网络时把 SERIAL_ONLY 设成 no 再构建，或在跑起来的系统里执行撤销：
+#   rm -f /etc/systemd/system/systemd-resolved.service \
+#         /etc/systemd/system/NetworkManager.service \
+#         /etc/systemd/system/networking.service \
+#         /etc/systemd/system/wpa_supplicant.service
+#   systemctl daemon-reload
+SERIAL_ONLY="${SERIAL_ONLY:-yes}"
+if [ "${SERIAL_ONLY}" = "yes" ]; then
+  systemctl mask systemd-resolved.service NetworkManager.service networking.service wpa_supplicant.service 2>/dev/null || true
+  echo "✅ SERIAL_ONLY=yes：已 mask 网络栈（systemd-resolved / NetworkManager / networking / wpa_supplicant）"
+else
+  echo "ℹ️  SERIAL_ONLY=no：保留网络栈（若 systemd-resolved 不 ready，串口 getty 会被压住）"
+fi
 
 echo "========== 审计 =========="
 echo "DISTRO=$DISTRO CODENAME=$CODENAME"
