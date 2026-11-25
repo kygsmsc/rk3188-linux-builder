@@ -1,0 +1,37 @@
+【在 ttl-rz12 的 "#" 提示符下，逐行粘贴下面这些命令（每行回车一次）】
+【把输出整段拍照/复制发回来即可】
+
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+
+echo "===== 1. init 是谁 ====="
+ls -l /sbin/init /lib/systemd/systemd 2>&1
+
+echo "===== 2. machine-id ====="
+cat /etc/machine-id 2>&1
+ls -l /var/lib/dbus/machine-id 2>&1
+
+echo "===== 3. fstab ====="
+cat /etc/fstab
+
+echo "===== 4. 启用了哪些 unit ====="
+ls -l /etc/systemd/system/multi-user.target.wants/ 2>&1
+ls -l /etc/systemd/system/getty.target.wants/ 2>&1
+ls -l /etc/systemd/system/sysinit.target.wants/ 2>&1
+
+echo "===== 5. systemd 版本与 os-release ====="
+systemctl --version 2>&1
+cat /etc/os-release
+
+echo "===== 6. 空间与内存 ====="
+df -h /
+free -m
+
+echo "===== 7. 关键目录是否存在 ====="
+ls -ld /run /var/log /var/log/journal /dev /proc /sys 2>&1
+
+echo "===== 8. 有没有 /dev/console、/dev/kmsg ====="
+ls -l /dev/console /dev/kmsg /dev/ttyS2 /dev/tty 2>&1
+
+echo "===== 9. 最后一个：手动跑 systemd，观察它跑到哪 ====="
+/sbin/init 2>&1

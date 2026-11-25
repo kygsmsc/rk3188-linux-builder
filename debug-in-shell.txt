@@ -1,0 +1,24 @@
+【不用刷参数也能开 debug：在 ttl-rz12 的 "#" 提示符下，逐行粘贴】
+【原理：把 systemd 的日志配置直接写进 rootfs（此时 rootfs 是 rw 挂着的），】
+【      再 exec systemd，效果与 CMDLINE 加 systemd.log_level=debug 完全一样，】
+【      而且不依赖 loader 那点可怜的 CMDLINE 长度。】
+
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+
+mkdir -p /etc/systemd/system.conf.d /etc/systemd/journald.conf.d
+
+printf '[Manager]\nLogTarget=kmsg\nLogLevel=debug\nShowStatus=yes\n' > /etc/systemd/system.conf.d/99-dbg.conf
+
+printf '[Journal]\nForwardToKMsg=yes\nStorage=volatile\n' > /etc/systemd/journald.conf.d/99-dbg.conf
+
+echo 8 > /proc/sys/kernel/printk
+
+cat /etc/systemd/system.conf.d/99-dbg.conf
+
+exec /sbin/init
+
+【exec 之后 shell 就没了，系统会带着 debug 日志往下跑。】
+【最后一条日志停在哪个 unit，卡的就是那个 unit —— 把最后 20 行发我。】
+【静默期间每 10 秒按一次回车，有些输出要等输入才刷到串口。】
+【恢复安静：进系统后执行 rm /etc/systemd/system.conf.d/99-dbg.conf /etc/systemd/journald.conf.d/99-dbg.conf】

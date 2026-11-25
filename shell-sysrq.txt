@@ -1,0 +1,48 @@
+#!/bin/sh
+# shell-sysrq.txt — 让内核自己把 systemd 的卡点打出来
+#
+# 用法：刷 parameter-shell.txt（init=/bin/sh），见到 "#" 之后，把下面全部行的
+#      命令部分整段粘贴进去（每行都是合法 shell 命令或 # 注释，可直接粘）。
+#
+# 原理：你手里只有 init=/bin/sh 才会得到可输入的 "#"；但那个状态下 systemd
+#      根本没跑，所以查不到它。这个脚本先布一个后台定时器，再 exec 真正的
+#      /sbin/init；等 systemd 卡死后，定时器到期会让内核自己打印现场：
+#        - 30 秒：w  -> 只打印处于 D（不可中断阻塞）状态的任务，最短最有指向性
+#        - 40 秒：t  -> 打印全部任务的内核栈（含 PID 1 systemd 的调用链）
+#        - 45 秒：l  -> 打印所有 CPU 的当前栈
+#      ARM unwinder + KALLSYMS_ALL 已开，栈里会带函数名，能直接看出它卡在
+#      哪个系统调用 / 哪个函数。
+#
+# 前提（已核实 configs/rk3188_defconfig）：
+#   CONFIG_MAGIC_SYSRQ=y / MAGIC_SYSRQ_DEFAULT_ENABLE=0x1 / MAGIC_SYSRQ_SERIAL=y
+#   CONFIG_KALLSYMS=y / KALLSYMS_ALL=y / CONFIG_UNWINDER_ARM=y
+#
+# 判读方法：
+#   日志里出现 "sysrq: Show Blocked State" 或 "sysrq: Show State"  -> 炸弹生效
+#   在 PID 1 那一段里找 "systemd" 进程的 Call trace：
+#     __schedule / schedule_timeout / wait_for_completion  -> 它在等某个子进程或锁
+#     do_wait / wait4 / kernel_wait4                       -> 它在等某个 fork 出去的子进程
+#       （若上层是 manager_startup -> exec 子进程，就是某个 generator 卡住不返回）
+#     vfs_read / pipe_read / n_tty_read                    -> 在读某个 fd（console/pipe）上死等
+#     mount / do_mount / ext4_*                             -> 卡在挂载/文件系统 IO
+#     msleep / schedule_timeout_uninterruptible            -> 卡在驱动里的延时（多半是某个 probe）
+#   如果连 "sysrq:" 字样都没有，说明内核已经完全锁死（连 SysRq 都进不去），
+#   那是另一类问题（通常是某个驱动在关中断的状态下死循环）。
+#
+# 收尾：拿到栈之后按复位键重来即可，本脚本不写盘、不改任何文件。
+
+# ---------------------------------------------------------------- 1. 挂 proc
+# 内核用 init=/bin/sh 启动时不会自动挂 /proc，写 /proc/sys 前必须先挂上。
+mount -t proc proc /proc
+
+# ------------------------------------------------------- 2. 显式打开 SysRq
+# defconfig 默认已是 0x1（全开），这里再写一次，防止被别的东西改掉。
+echo 1 > /proc/sys/kernel/sysrq
+
+# ------------------------------------------------------------ 3. 布定时炸弹
+# 放到后台：exec 之后这个子进程仍然活着（被 PID 1 收养），到点自动触发。
+( sleep 30; echo w > /proc/sysrq-trigger; sleep 10; echo t > /proc/sysrq-trigger; sleep 5; echo l > /proc/sysrq-trigger ) &
+
+# --------------------------------------------------- 4. 启动真正的 systemd
+# 与 parameter.txt 里的 init=/sbin/init 完全同一目标，保证复现的是同一个现场。
+exec /sbin/init

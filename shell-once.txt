@@ -1,0 +1,38 @@
+# 在 parameter-shell.txt 的 "#" 提示符下，整段粘贴本文件内容
+# 先采集 6 组事实，再把 systemd 的 debug 配置写进 rootfs，最后交给 systemd
+
+cd /
+mount -t proc proc /proc 2>/dev/null
+mount -t sysfs sysfs /sys 2>/dev/null
+
+echo "=========== A. 基本 ==========="
+uname -a
+ls -l /sbin/init /lib/systemd/systemd
+cat /etc/machine-id
+
+echo "=========== B. fstab ==========="
+cat /etc/fstab
+
+echo "=========== C. 已启用的 unit ==========="
+ls /etc/systemd/system/multi-user.target.wants/ 2>&1
+ls /etc/systemd/system/getty.target.wants/ 2>&1
+ls /etc/systemd/system/sysinit.target.wants/ 2>&1
+
+echo "=========== D. 关键设备节点 ==========="
+ls -l /dev/console /dev/kmsg /dev/ttyS2 /dev/tty 2>&1
+
+echo "=========== E. 空间与内存 ==========="
+df -h /
+free -m
+
+echo "=========== F. 打开 debug，交给 systemd ==========="
+mkdir -p /etc/systemd/system.conf.d /etc/systemd/journald.conf.d
+printf '[Manager]\nLogTarget=kmsg\nLogLevel=debug\nShowStatus=yes\n' > /etc/systemd/system.conf.d/99-dbg.conf
+printf '[Journal]\nForwardToKMsg=yes\nStorage=volatile\n' > /etc/systemd/journald.conf.d/99-dbg.conf
+echo 8 > /proc/sys/kernel/printk
+cat /etc/systemd/system.conf.d/99-dbg.conf
+exec /sbin/init
+
+# exec 之后 shell 就没了，systemd 带着 debug 日志继续跑。
+# 最后一条日志停在哪个 unit = 卡在那个 unit；静默期间每 10 秒按一次回车。
+# 恢复安静：进系统后 rm /etc/systemd/system.conf.d/99-dbg.conf /etc/systemd/journald.conf.d/99-dbg.conf

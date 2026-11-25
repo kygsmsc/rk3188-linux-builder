@@ -1,6 +1,12 @@
 /*
  * mkkrnlimg.c — Rockchip KRNL 内核镜像封装器（修正版）
  *
+ * ⚠️ 已弃用（2026-11 第二轮核对编译教程后）：
+ *   本项目 boot 分区实际应使用 Rockchip mkbootimg 打 Android boot image
+ *   （ANDROID! header，build.yml 步骤 8 已 clone neo-technologies/rockchip-mkbootimg
+ *   编译并调用）。老 SDK loader 按 Android boot image 解析内核加载地址；
+ *   KRNL tag 封装不被该 loader 接受。本文件仅保留备查，workflow 不再调用。
+ *
  * 用法:
  *   gcc mkkrnlimg.c -o mkkrnlimg
  *   ./mkkrnlimg zImage-dtb boot.img
