@@ -919,38 +919,38 @@ jobs:
           cp "$GITHUB_WORKSPACE/parameter-rescue.txt" "$FINAL_DIR/parameter-rescue.txt"
           echo "✅ parameter-rescue.txt（取自仓库）"
         else
-          python3 - "$GITHUB_WORKSPACE/parameter.txt" "$FINAL_DIR/parameter-rescue.txt" << 'PY'
-          import sys
-          src, dst = sys.argv[1], sys.argv[2]
-          banner = [
-              '# =====================================================================',
-              '# parameter-rescue.txt —— 由 parameter.txt 自动派生（仓库未提供该文件）',
-              '#',
-              '# 唯一差别：CMDLINE 里保留 initrd=0x62000000,0x00800000。',
-              '# RK31 loader 看到这一项才会把 boot.img 里的 ramdisk 搬到 0x62000000；',
-              '# 只给 boot-rescue.img（带救援 initramfs）用。主刷 boot.img 是纯内核，',
-              '# 带 initrd= 会让内核去解一段残留垃圾并跳过挂根（ttl-rz10 的 panic）。',
-              '# =====================================================================',
-          ]
-          out = []
-          for line in open(src, encoding='utf-8').read().splitlines():
-              if line.startswith('CMDLINE:'):
-                  out.extend(banner)
-                  assert ' init=/sbin/init ' in line, 'parameter.txt 的 CMDLINE 里没有 init=/sbin/init'
-                  line = line.replace(' init=/sbin/init ',
-                                      ' init=/sbin/init initrd=0x62000000,0x00800000 ', 1)
-              out.append(line)
-          open(dst, 'w', encoding='utf-8').write('\n'.join(out) + '\n')
-          print('✅ parameter-rescue.txt（由 parameter.txt 自动派生）')
-          PY
-          python3 - "$FINAL_DIR/parameter-rescue.txt" << 'PY'
-          import sys
-          cm = [l for l in open(sys.argv[1], encoding='utf-8')
-                if l.startswith('CMDLINE:')][0]
-          assert 'initrd=0x62000000,' in cm, '派生失败：没有写进 initrd='
-          assert 'blkdevparts=mmcblk1:' in cm, '派生失败：blkdevparts 丢了'
-          print('  ✅ 派生结果校验通过：有 initrd=、有 blkdevparts')
-          PY
+        python3 - "$GITHUB_WORKSPACE/parameter.txt" "$FINAL_DIR/parameter-rescue.txt" << 'PY'
+        import sys
+        src, dst = sys.argv[1], sys.argv[2]
+        banner = [
+            '# =====================================================================',
+            '# parameter-rescue.txt —— 由 parameter.txt 自动派生（仓库未提供该文件）',
+            '#',
+            '# 唯一差别：CMDLINE 里保留 initrd=0x62000000,0x00800000。',
+            '# RK31 loader 看到这一项才会把 boot.img 里的 ramdisk 搬到 0x62000000；',
+            '# 只给 boot-rescue.img（带救援 initramfs）用。主刷 boot.img 是纯内核，',
+            '# 带 initrd= 会让内核去解一段残留垃圾并跳过挂根（ttl-rz10 的 panic）。',
+            '# =====================================================================',
+        ]
+        out = []
+        for line in open(src, encoding='utf-8').read().splitlines():
+            if line.startswith('CMDLINE:'):
+                out.extend(banner)
+                assert ' init=/sbin/init ' in line, 'parameter.txt 的 CMDLINE 里没有 init=/sbin/init'
+                line = line.replace(' init=/sbin/init ',
+                                    ' init=/sbin/init initrd=0x62000000,0x00800000 ', 1)
+            out.append(line)
+        open(dst, 'w', encoding='utf-8').write('\n'.join(out) + '\n')
+        print('✅ parameter-rescue.txt（由 parameter.txt 自动派生）')
+        PY
+        python3 - "$FINAL_DIR/parameter-rescue.txt" << 'PY'
+        import sys
+        cm = [l for l in open(sys.argv[1], encoding='utf-8')
+              if l.startswith('CMDLINE:')][0]
+        assert 'initrd=0x62000000,' in cm, '派生失败：没有写进 initrd='
+        assert 'blkdevparts=mmcblk1:' in cm, '派生失败：blkdevparts 丢了'
+        print('  ✅ 派生结果校验通过：有 initrd=、有 blkdevparts')
+        PY
         fi
         cp "$GITHUB_WORKSPACE/kernel.config" "$FINAL_DIR/kernel.config"
 
