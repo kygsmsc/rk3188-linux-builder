@@ -424,12 +424,29 @@
 };
 
 &pinctrl {
-	/* D0/D1 复用成 GPIO（RK_FUNC_GPIO = 0）。MDC 只输出，不配上下拉；
-	 * MDIO 是双向开漏线，配上拉，和板上 1.5k~4.7k 外部上拉并联不会出问题。 */
-	emac_mdio_gpio: emac-mdio-gpio {
-		/* D1 = MDC 只输出，不配上下拉；D0 = MDIO 双向，配上拉 */
-		rockchip,pins = <3 RK_PD1 RK_FUNC_GPIO &pcfg_pull_none>,
-		                <3 RK_PD0 RK_FUNC_GPIO &pcfg_pull_up>;
+	/* ----------------------------------------------------------------
+	 * 【第二十四轮修正：group 必须挂在"函数节点"下面，不能直接放顶层】
+	 *
+	 * 上一版把 emac_mdio_gpio 直接写成 &pinctrl 的子节点，实机日志报：
+	 *   rockchip-pinctrl pinctrl: unable to find group for node emac-mdio-gpio
+	 * 原因在 pinctrl-rockchip.c 的 rockchip_pinctrl_parse_functions()：
+	 *   func->ngroups = of_get_child_count(np);
+	 *   if (func->ngroups <= 0) return 0;     ← 没有子节点就整个跳过
+	 * 也就是说 pinctrl 顶层每个子节点被当成"一个函数"，它的**子节点**才是
+	 * 真正的 group。group 直接放顶层 → 既不注册 group，也查不到这个 phandle，
+	 * 于是 mdio-gpio 节点 pinctrl-0 应用失败、驱动没 probe，PHY 根本没注册，
+	 * emac 拿着 phy0 去找人自然 of_phy_connect() failed (-19)。
+	 *
+	 * 这里把 group 挪进 dtsi 里本来就有的 emac 函数节点（DT 同名节点自动合并），
+	 * 和上面 pmic / hym8563 / ir-receiver 的写法保持一致。
+	 * ---------------------------------------------------------------- */
+	emac {
+		/* D1 = MDC 只输出，不配上下拉；D0 = MDIO 双向，配上拉
+		 * （双向开漏线配上拉，与板上外部上拉并联不会出问题） */
+		emac_mdio_gpio: emac-mdio-gpio {
+			rockchip,pins = <3 RK_PD1 RK_FUNC_GPIO &pcfg_pull_none>,
+			                <3 RK_PD0 RK_FUNC_GPIO &pcfg_pull_up>;
+		};
 	};
 
 	pmic { pmic_int: pmic-int { rockchip,pins = <0 RK_PB3 RK_FUNC_GPIO &pcfg_pull_up>; }; };
