@@ -279,7 +279,41 @@
 };
 
 &emac {
-	phy-handle = <&phy0>;
+	/* ---- 第二十二轮：属性名从 phy-handle 改成 phy（本轮唯一改动）----
+	 * 原值（保留备查）：phy-handle = <&phy0>;
+	 *
+	 * 为什么必须改（6.12 源码，drivers/net/ethernet/arc/emac_main.c:869）：
+	 *   phy_node = of_parse_phandle(dev->of_node, "phy", 0);
+	 *   if (!phy_node) {
+	 *           dev_err(dev, "failed to retrieve phy description from device tree");
+	 *           return -ENODEV;
+	 *   }
+	 * 驱动找的是名为 "phy" 的 phandle，而 "phy-handle" 是 stmmac/其他驱动的写法。
+	 * 属性名对不上 → 直接返回 -ENODEV(-19) → 网卡根本注册不上，
+	 * 于是 /sys/class/net 里只有 lo 和 sit0（sit0 是 IPv6 隧道占位设备）。
+	 * 实机日志完全对得上：
+	 *   rockchip_emac 10204000.ethernet: failed to retrieve phy description from device tree
+	 *   rockchip_emac 10204000.ethernet: failed to probe arc emac (-19)
+	 *
+	 * 另一个"看着像错、其实无害"的日志是 "no regulator found"，
+	 * 出自 emac_rockchip.c:162 的 devm_regulator_get_optional()，可选，忽略即可。
+	 *
+	 * phy-mode 本来不用写（基节点 rk3xxx.dtsi:203 已有 phy-mode = "rmii"，
+	 * 且 emac_rockchip.c:121 只接受 RMII，继承下来正好）；这里显式再写一遍，
+	 * 是为了万一将来换基树/换版本时该属性丢失 —— 值与原继承值完全相同，
+	 * 属于"写了不改行为"的保险，参考朋友那份 rk3188-adesk.dts:199。
+	 */
+	phy-mode = "rmii";
+
+	/* 参考朋友那份 rk3188-adesk.dts:200 补上 PHY 供电引用。
+	 * 原状（无此行）会打印 "rockchip_emac 10204000.ethernet: no regulator found"，
+	 * 该告警来自 emac_rockchip.c:162 的 devm_regulator_get_optional(dev, "phy")，
+	 * 本身不致命；补上后这行噪音消失，并把 3.3V IO 电源正式挂到 PHY 上。
+	 * vcc_io 在本 dts 里是 regulator-fixed、regulator-always-on，enable 是空操作，无风险。
+	 */
+	phy-supply = <&vcc_io>;
+
+	phy = <&phy0>;          /* 关键：驱动要的是 phy，不是 phy-handle，见上方说明 */
 	pinctrl-names = "default";
 	pinctrl-0 = <&emac_xfer>, <&emac_mdio>;
 	status = "okay";
