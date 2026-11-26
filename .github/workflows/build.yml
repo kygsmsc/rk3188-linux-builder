@@ -357,9 +357,12 @@ jobs:
         # 这里把两个分区符号 + 启动链路必需符号一起校验，缺任何一个直接失败，
         # 不产出"注定 panic"的刷机包。
         # ========================================================
+        # 第二十三轮追加：网口走 GPIO 模拟 MDIO（mdio-gpio），两个符号缺一个都会
+        # 让 DTB 里的 mdio-gpio 节点无人认领 → eth0 永远不出现。
         for sym in CONFIG_PARTITION_ADVANCED CONFIG_CMDLINE_PARTITION \
                    CONFIG_MMC_DW_ROCKCHIP CONFIG_EXT4_FS CONFIG_DEVTMPFS \
-                   CONFIG_ARM_ATAG_DTB_COMPAT_CMDLINE_FROM_BOOTLOADER; do
+                   CONFIG_ARM_ATAG_DTB_COMPAT_CMDLINE_FROM_BOOTLOADER \
+                   CONFIG_ARC_EMAC_CORE CONFIG_MDIO_BITBANG CONFIG_MDIO_GPIO; do
           grep -q "^${sym}=y" .config || { echo "❌ ${sym} 未启用"; exit 1; }
           echo "  ✅ ${sym}=y"
         done
