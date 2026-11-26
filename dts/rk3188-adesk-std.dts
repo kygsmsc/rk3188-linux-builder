@@ -15,6 +15,9 @@
 		/* 物理 TTL 接 UART2（0x20064000）；uart2 由 dtsi 默认 alias serial2 映射为 ttyS2 */
 		serial0 = &uart0;
 		serial2 = &uart2;
+		/* mdio-gpio 总线别名：驱动靠它取 bus id（of_alias_get_id(node,"mdio-gpio")），
+		 * 没有这行只会打印一句 failed to get alias id 然后 id=0，功能不受影响 */
+		mdio-gpio0 = &mdio_gpio;
 		mmc0 = &mmc0;   /* SD 卡控制器（本机无卡槽，节点已 disabled，别名保留仅占位） */
 		mmc1 = &emmc;   /* eMMC 控制器：这条别名决定它固定是 mmc1 → /dev/mmcblk1，
 		                   必须保留，否则 root=/dev/mmcblk1p1 会失效 */
@@ -129,6 +132,50 @@
 		regulator-min-microvolt = <3300000>;
 		regulator-max-microvolt = <3300000>;
 		regulator-always-on;
+	};
+
+	/* ============================================================
+	 * 第二十三轮：MDIO 改成 GPIO 软件模拟总线（bit-bang）
+	 * ============================================================
+	 * 依据一（原厂固件）：从原机 kernel.img 里提取到的字符串是
+	 *   mdio_bb_read / mdio_bb_write              → 原厂就是软件 bit-bang
+	 *   "request mdio pin ok" / "request mdc pin ok" → 把两只脚当 GPIO 申请
+	 *   "output mdio ctl pin ok , enable rtl8201f ethernet function"
+	 * 依据二（实机）：ttl-16/ttl-17 用 SoC 硬件 MDIO 读 RTL8201FN，0~7 号地址
+	 * 全部 missing，每次超时约 33ms（读到的是上拉电平 0xffff）；而 RJ45 指示灯是亮的，
+	 * 说明 PHY 有电、链路正常，只是管理口这条通路没通。
+	 *
+	 * 做法：GPIO3_D0/D1 从 EMAC 复用功能改成 GPIO，交给内核 mdio-gpio 驱动
+	 * 用软件时序扫描；速率由软件决定，远低于 RTL8201FN 的 MDC 上限 2.5MHz。
+	 * 同时把 0~7 全部地址都声明出来：一次启动既验证通路，又直接定位 PHY 地址。
+	 */
+	mdio_gpio: mdio-gpio {
+		compatible = "virtual,mdio-gpio";
+		#address-cells = <1>;
+		#size-cells = <0>;
+		/* gpios 顺序固定：第 1 个 = MDC（输出），第 2 个 = MDIO（双向）。
+		 * 引脚对应关系不是猜的，取自 RK3188 TRM V1.3 第 1.3.2 节引脚表：
+		 *   GPIO3_D[0] G23 ... sdmmc1_pwr_en / mii_md  → mii_md 就是 MDIO，在 D0
+		 *   GPIO3_D[1] ...                  / mii_mdc  → MDC 在 D1
+		 * （mainline 的 emac_mdio 组把两只脚都复用成功能 2，那里不区分先后，
+		 *   所以 dtsi 里 PD0/PD1 的书写顺序不能当作 MDC/MDIO 的依据。） */
+		gpios = <&gpio3 RK_PD1 GPIO_ACTIVE_HIGH>,   /* MDC  = GPIO3_D1 */
+		        <&gpio3 RK_PD0 GPIO_ACTIVE_HIGH>;   /* MDIO = GPIO3_D0 */
+		pinctrl-names = "default";
+		pinctrl-0 = <&emac_mdio_gpio>;
+		status = "okay";
+
+		/* RTL8201FN 的 PHY 地址只能取 000b~111b（数据手册 5.x / 8.1.2），
+		 * 故把 0~7 全列出来：没有芯片的地址会打印一行 missing，
+		 * 唯一不打 missing 的那个，就是真实地址。 */
+		phy0: ethernet-phy@0 { reg = <0>; };
+		phy1: ethernet-phy@1 { reg = <1>; };
+		phy2: ethernet-phy@2 { reg = <2>; };
+		phy3: ethernet-phy@3 { reg = <3>; };
+		phy4: ethernet-phy@4 { reg = <4>; };
+		phy5: ethernet-phy@5 { reg = <5>; };
+		phy6: ethernet-phy@6 { reg = <6>; };
+		phy7: ethernet-phy@7 { reg = <7>; };
 	};
 
 	gpio-keys {
@@ -315,14 +362,21 @@
 
 	phy = <&phy0>;          /* 关键：驱动要的是 phy，不是 phy-handle，见上方说明 */
 	pinctrl-names = "default";
-	pinctrl-0 = <&emac_xfer>, <&emac_mdio>;
+	/* 原值（保留备查）：pinctrl-0 = <&emac_xfer>, <&emac_mdio>;
+	 * GPIOD0/D1 已被 mdio-gpio 当 GPIO 用掉了，这里不能再申请为 EMAC 复用功能，
+	 * 否则 pinctrl 会把同一只脚配成两种功能，后者覆盖前者。 */
+	pinctrl-0 = <&emac_xfer>;
 	status = "okay";
 
-	mdio {
-		#address-cells = <1>;
-		#size-cells = <0>;
-		phy0: ethernet-phy@0 { reg = <0>; };
-	};
+	/* 原值（保留备查）：内部 mdio 子节点，phy0 在这里
+	 *   mdio {
+	 *           #address-cells = <1>;
+	 *           #size-cells = <0>;
+	 *           phy0: ethernet-phy@0 { reg = <0>; };
+	 *   };
+	 * 现在 phy0 移到 root 下的 mdio_gpio 总线里，硬件 MDIO 总线上不再挂 PHY，
+	 * 但驱动仍会注册这条空总线（arc_mdio_probe 在没有 mdio 子节点时
+	 * 用 emac 节点本身注册），不影响功能。 */
 };
 
 &usbphy { status = "okay"; };
@@ -370,6 +424,14 @@
 };
 
 &pinctrl {
+	/* D0/D1 复用成 GPIO（RK_FUNC_GPIO = 0）。MDC 只输出，不配上下拉；
+	 * MDIO 是双向开漏线，配上拉，和板上 1.5k~4.7k 外部上拉并联不会出问题。 */
+	emac_mdio_gpio: emac-mdio-gpio {
+		/* D1 = MDC 只输出，不配上下拉；D0 = MDIO 双向，配上拉 */
+		rockchip,pins = <3 RK_PD1 RK_FUNC_GPIO &pcfg_pull_none>,
+		                <3 RK_PD0 RK_FUNC_GPIO &pcfg_pull_up>;
+	};
+
 	pmic { pmic_int: pmic-int { rockchip,pins = <0 RK_PB3 RK_FUNC_GPIO &pcfg_pull_up>; }; };
 	hym8563 { rtc_int: rtc-int { rockchip,pins = <0 RK_PB5 RK_FUNC_GPIO &pcfg_pull_up>; }; };
 	ir-receiver { ir_recv_pin: ir-recv-pin { rockchip,pins = <0 RK_PB2 RK_FUNC_GPIO &pcfg_pull_none>; }; };
