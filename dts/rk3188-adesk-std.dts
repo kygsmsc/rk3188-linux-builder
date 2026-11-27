@@ -453,3 +453,50 @@
 	hym8563 { rtc_int: rtc-int { rockchip,pins = <0 RK_PB5 RK_FUNC_GPIO &pcfg_pull_up>; }; };
 	ir-receiver { ir_recv_pin: ir-recv-pin { rockchip,pins = <0 RK_PB2 RK_FUNC_GPIO &pcfg_pull_none>; }; };
 };
+
+/* ============================================================
+ * 第三十一轮：PHY 使能脚（决定性发现，网口不通的最终根因）
+ * ============================================================
+ * 实测过程（ttl-26，mdio-scan probe）：
+ *   按住 GPIO3_D2(122) 高电平，再逐只把候选脚拉高/拉低，每次扫 D1/D0 的 0~7；
+ *   扫到第 2 步 GPIO0_A0(0) 拉低时，MDIO 上立刻出现应答：
+ *     addr 0 : id=0x001CC816   ← RTL8201F/FN 的 PHY ID（Realtek）
+ * 也就是说：
+ *   1) MDC/MDIO 一直就接在 GPIO3_D1(D1)/GPIO3_D0(D0)，此前 ttl-16~25 全部失败
+ *      不是接错脚，而是 PHY 从来没被这只脚"打开"；
+ *   2) GPIO0_A0 低电平 = PHY 工作，高电平 = PHY 不工作。
+ *
+ * TRM 依据（RK3188 TRM V1.3 §1.3.2 引脚表，AC4 球）：
+ *   GPIO0_A[0]  AC4  GPIO0_A[0]  （复用功能栏全空）  I/O  2bit  Down
+ *   → 它是纯 GPIO，没有第二功能，不参与 Flash / PMIC / eMMC / UART，
+ *     所以把它固定成输出低电平是安全的（本 dts 里也没有别的节点用它）。
+ *
+ * 做法：用 gpio-hog 在 gpiochip 注册时就把电平定死。
+ *   gpio-hog 由 gpiolib 在 gpiochip_add_data() 里应用，早于 mdio-gpio / emac 的 probe，
+ *   所以 PHY 会在内核扫描 MDIO 之前就已经就绪，不存在"时序抢不过"的问题。
+ *
+ * 为什么 GPIO_ACTIVE_HIGH + output-low：
+ *   这里要的是"物理电平低"，polarity 只是逻辑描述，用 ACTIVE_HIGH 表达最不容易误解。
+ * ============================================================ */
+&gpio0 {
+	phy_en: phy-en {
+		gpio-hog;
+		gpios = <RK_PA0 GPIO_ACTIVE_HIGH>;
+		output-low;                 /* 物理低电平 = PHY 工作 */
+		line-name = "phy-en";
+	};
+};
+
+/* GPIO3_D2 = 122：实测拉高时 RJ45 绿灯亮、拉低时灭。
+ * 它与 PHY 的 MDIO 应答没有直接关系（ttl-24/25 只拉高它，MDIO 仍全 F），
+ * 但它是板上以太网相关的一只使能/指示脚；原值由 loader 驱动为低。
+ * 这里一并固定为高电平，保证与原厂"enable rtl8201f ethernet function"的状态一致。
+ * 若后续确认它只控制 LED、对 PHY 无作用，可以整段删掉，不影响网口功能。 */
+&gpio3 {
+	phy_pwr: phy-pwr {
+		gpio-hog;
+		gpios = <RK_PD2 GPIO_ACTIVE_HIGH>;
+		output-high;
+		line-name = "phy-pwr";
+	};
+};
