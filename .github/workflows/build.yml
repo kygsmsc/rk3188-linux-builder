@@ -359,12 +359,27 @@ jobs:
         # ========================================================
         # 第二十三轮追加：网口走 GPIO 模拟 MDIO（mdio-gpio），两个符号缺一个都会
         # 让 DTB 里的 mdio-gpio 节点无人认领 → eth0 永远不出现。
+        # 必须内建（=y）的符号：分区解析、存储、根文件系统、ATAG 兼容
         for sym in CONFIG_PARTITION_ADVANCED CONFIG_CMDLINE_PARTITION \
                    CONFIG_MMC_DW_ROCKCHIP CONFIG_EXT4_FS CONFIG_DEVTMPFS \
                    CONFIG_ARM_ATAG_DTB_COMPAT_CMDLINE_FROM_BOOTLOADER \
-                   CONFIG_ARC_EMAC_CORE CONFIG_MDIO_BITBANG CONFIG_MDIO_GPIO; do
+                   CONFIG_MDIO_BITBANG CONFIG_MDIO_GPIO; do
           grep -q "^${sym}=y" .config || { echo "❌ ${sym} 未启用"; exit 1; }
           echo "  ✅ ${sym}=y"
+        done
+        # 网口符号：=y 或 =m 都算通过。
+        # 第三十四轮起改成 =m（CONFIG_ARC_EMAC_CORE=m / CONFIG_EMAC_ROCKCHIP=m），
+        # 靠 rootfs 里的 emac-late.service 在 systemd 早期之后再 modprobe，
+        # 绕开"eth0 早期存在 → PID1 硬卡死"的时机冲突（ttl-27~ttl-32 实证）。
+        for sym in CONFIG_ARC_EMAC_CORE CONFIG_EMAC_ROCKCHIP; do
+          if grep -q "^${sym}=y" .config; then
+            echo "  ✅ ${sym}=y（内建，早期就会 probe）"
+          elif grep -q "^${sym}=m" .config; then
+            echo "  ✅ ${sym}=m（模块，由 emac-late.service 迟到加载）"
+            grep -q "^CONFIG_MODULES=y" .config || { echo "❌ ${sym}=m 但 CONFIG_MODULES 未启用"; exit 1; }
+          else
+            echo "❌ ${sym} 未启用"; exit 1
+          fi
         done
         grep -E "CONFIG_(PARTITION_ADVANCED|CMDLINE_PARTITION)=" .config
 
@@ -438,6 +453,30 @@ jobs:
           INSTALL_MOD_PATH="$GITHUB_WORKSPACE/usb_pure_rootfs" modules_install
         sudo chroot "$GITHUB_WORKSPACE/usb_pure_rootfs" /bin/bash -c 'depmod -a 2>/dev/null || true' || true
 
+        # ========================================================
+        # 【第三十四轮守卫】网口改了 =m，就必须确认 .ko 真的装进了 rootfs。
+        # 否则刷完盘登录后 modprobe 会 "module not found"，而这个错误在串口上
+        # 很容易被当成"又卡死了"，白跑一轮刷机。
+        # ========================================================
+        if grep -q "^CONFIG_EMAC_ROCKCHIP=m" .config; then
+          echo "===== 网口模块入盘校验 ====="
+          KO_ROOT="$GITHUB_WORKSPACE/usb_pure_rootfs/lib/modules"
+          for ko in arc_emac emac_rockchip; do
+            hit=$(find "$KO_ROOT" -name "${ko}.ko*" 2>/dev/null | head -1)
+            if [ -z "$hit" ]; then
+              echo "❌ 找不到 ${ko}.ko（modules_install 没落盘）"; exit 1
+            fi
+            echo "  ✅ ${ko}.ko -> ${hit#${GITHUB_WORKSPACE}/}"
+          done
+          if [ -f "${KO_ROOT}/"*/modules.dep ]; then
+            grep -q "emac_rockchip" "${KO_ROOT}/"*/modules.dep \
+              || { echo "❌ modules.dep 里没有 emac_rockchip（depmod 失败，modprobe 会找不到）"; exit 1; }
+            echo "  ✅ modules.dep 已登记 emac_rockchip"
+          else
+            echo "❌ 找不到 modules.dep"; exit 1
+          fi
+        fi
+
         mkdir -p "$GITHUB_WORKSPACE/dtb_out"
         find "arch/${ARCH}/boot/dts" -name "*.dtb" -exec cp {} "$GITHUB_WORKSPACE/dtb_out/" \;
         cp "arch/${ARCH}/boot/${KERNEL_IMAGE}" "$GITHUB_WORKSPACE/${KERNEL_IMAGE}"
@@ -448,6 +487,70 @@ jobs:
 
         test -f "$GITHUB_WORKSPACE/dtb_out/${BOARD}.dtb" || { echo "❌ 找不到 ${BOARD}.dtb"; exit 1; }
         echo "✅ 内核与 dtb 编译完成"
+
+        # ========================================================
+        # 【第二十四轮守卫 A】pinctrl group 的嵌套深度自检
+        #
+        # 实机踩过的坑（ttl-18）：
+        #   rockchip-pinctrl pinctrl: unable to find group for node emac-mdio-gpio
+        # 因为 group 被直接写成 &pinctrl 的子节点，而 pinctrl-rockchip.c 的
+        # rockchip_pinctrl_parse_functions() 是"顶层子节点 = 函数，函数的子节点 = group"：
+        #   func->ngroups = of_get_child_count(np);  if (func->ngroups <= 0) return 0;
+        # 顶层 group 既不注册、也查不到 phandle，pinctrl-0 应用失败 → mdio-gpio 不 probe
+        # → PHY 没注册 → of_phy_connect() failed (-19) → eth0 永不出现，而且没有明显报错。
+        # 这里在编译期就直接卡死：&pinctrl 里每条 rockchip,pins 必须处在 函数 → group 两层
+        # 里（也就是相对 &pinctrl 的 { 之后至少 2 层，深度 >= 3）。
+        # ========================================================
+        python3 - "$GITHUB_WORKSPACE/dts/${BOARD}.dts" << 'PY'
+        import re, sys
+        path = sys.argv[1]
+        src = open(path, encoding='utf-8').read()
+        clean = re.sub(r'/\*.*?\*/', '', src, flags=re.S)
+        clean = re.sub(r'//[^\n]*', '', clean)
+        m = re.search(r'&pinctrl\s*\{', clean)
+        if not m:
+            raise SystemExit("FAIL: 找不到 &pinctrl 节点")
+        depth = 0
+        bad = []
+        i = m.end() - 1
+        token = 'rockchip,pins'
+        while i < len(clean):
+            ch = clean[i]
+            if clean.startswith(token, i):
+                if depth < 3:
+                    bad.append((depth, clean[max(0, i - 120):i].strip().splitlines()[-1]))
+                i += len(token)
+                continue
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        if bad:
+            for d, ctx in bad:
+                print("  ❌ group 嵌套错误（深度 %d）：%s" % (d, ctx))
+            raise SystemExit("FAIL: &pinctrl 下的 group 必须放在函数节点里（深度 >= 3）")
+        print("  OK: &pinctrl 下所有 rockchip,pins 都正确嵌在 函数→group 两层里")
+        if 'virtual,mdio-gpio' not in src:
+            raise SystemExit("FAIL: dts 里没有 mdio-gpio 节点（virtual,mdio-gpio）")
+        if not re.search(r'phy0\s*:', src):
+            raise SystemExit("FAIL: dts 里没有 phy0 候选节点")
+        print("  OK: mdio-gpio 节点与 phy0 候选节点都在")
+        PY
+
+        # ========================================================
+        # 【第二十四轮守卫 B】反编译编出来的 DTB，确认节点真的落进去了
+        # （上一轮的教训是"源码改了、DTB 里没有"这种事只有实物才能证明）
+        # ========================================================
+        scripts/dtc/dtc -I dtb -O dts \
+          -o /tmp/chk-dtb.dts "arch/${ARCH}/boot/dts/rockchip/${BOARD}.dtb" || {
+            echo "❌ dtc 反编译 ${BOARD}.dtb 失败"; exit 1; }
+        for kw in "virtual,mdio-gpio" "phy-mode = \"rmii\"" "mdio-gpio0"; do
+          grep -q "$kw" /tmp/chk-dtb.dts || { echo "❌ DTB 里缺少 [$kw]"; exit 1; }
+          echo "  ✅ DTB 含 $kw"
+        done
 
         # 【第十轮·守卫】本机没有 SD/TF 卡槽：dts 里 &mmc0 必须是 disabled，
         # 且 aliases 必须保留 mmc1 = &emmc。
